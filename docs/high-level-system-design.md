@@ -2,76 +2,118 @@
 
 ## Purpose
 
-This document describes a high-level architecture for implementing the stock exchange system defined in [engineering-case-marcelo.md](/Users/marcelomarchetto/Desktop/decade/docs/engineering-case-marcelo.md).
+This document describes a lean scalable architecture for implementing the exchange defined in [engineering-case-marcelo.md](/Users/marcelomarchetto/Desktop/decade/docs/engineering-case-marcelo.md).
 
-The goal is to design a system that is:
+It keeps the core exchange invariants required for a scalable system:
 
-- correct in terms of matching behavior
-- deterministic under concurrency
-- fast on the hot path
-- recoverable after failures
-- easy to evolve toward a more exchange-grade architecture
-
-This document intentionally stays at the system-design level and does not prescribe implementation details or code.
+- deterministic price-time-priority matching
+- single writer per symbol
+- durable order acceptance
+- horizontal scale across symbols
+- recovery after failure
 
 ## Scope
 
 The required core behavior is:
 
 - brokers submit buy and sell orders
-- the system assigns an order identifier
-- orders can be queried later by identifier
+- the system assigns an exchange order identifier
+- brokers can query order status later by identifier
 - orders are matched by symbol, price, validity, and time priority
 - partial fills are supported
-- when a bid and ask cross, execution happens at the seller price
+- execution price is the seller price whenever bid and ask cross
 
-Out of scope for the initial design:
+Out of scope for this design:
 
 - brokerage accounts and balances
 - custody and settlement
 - KYC, AML, and customer compliance workflows
-- advanced market mechanisms such as auctions or market orders
-- multi-region deployment
+- advanced market mechanisms such as market orders or auctions
+- multi-region active-active deployment
 
-## Core Design Principles
+## Design Goals
+
+### Functional goals
+
+- preserve price-time priority for every symbol
+- support partial fills and resting orders
+- prevent expired orders from trading
+- expose a broker-facing API that is simple to consume
+
+### Non-functional goals
+
+- scale broker-facing traffic independently from matching throughput
+- guarantee one active writer per symbol
+- keep the edge tier horizontally scalable with autoscaling
+- keep the engine tier horizontally scalable within a fixed partition count
+- survive process crashes and duplicate delivery
+- keep the design operationally small enough to build and explain clearly
+
+## Core Invariants
 
 ### 1. Single writer per symbol
 
-For any given stock symbol, matching must happen through exactly one active sequencer at a time.
+For any given symbol, matching must happen through exactly one active engine owner at a time.
 
-This is the most important architectural rule because it guarantees:
+This guarantees:
 
 - deterministic price-time priority
-- no race conditions inside one order book
-- simpler correctness reasoning
-- lower locking overhead on the hot path
+- no concurrent write races inside one order book
+- simpler recovery and replay semantics
 
-### 2. In-memory matching, durable persistence
+### 2. Authoritative ordering comes from the engine path
 
-The matching engine should keep active order books in memory for speed, while persisting accepted orders, executions, and state transitions durably for recovery and auditability.
+Client timestamps are not authoritative.
 
-### 3. Explicit separation of write and read paths
+The authoritative order for matching is the order in which the owning engine consumer processes commands for that symbol from the ordered command stream.
 
-The write path should be optimized for order acceptance and matching. Querying order state should be served from persisted state or read projections, not by directly inspecting engine internals.
+The broker API may assign:
 
-### 4. Deterministic ordering
+- a public order identifier
+- an acceptance timestamp
 
-The exchange, not the client, should assign the authoritative sequence for order processing. Client timestamps are not sufficient for strict chronological ordering.
+But the matching engine owns the ordering that determines fill priority.
 
-## Proposed System Architecture
+### 3. Successful submission requires persistence and publish
 
-The system should begin as a modular monolith with clear internal boundaries. This keeps operations simple while preserving a clean path to future partitioning and service extraction.
+The broker API should acknowledge an order only after:
 
-Core modules:
+- the order has been persisted in PostgreSQL
+- the `SubmitOrder` command has been accepted by Kafka
 
-- `Broker API`
-- `Validation and Intake`
-- `Routing and Partitioning`
-- `Matching Engine`
-- `Persistence Layer`
-- `Read Model / Query Layer`
-- `Expiration Worker`
-- `Observability and Operations`
+This keeps the API asynchronous from the matching point of view while still ensuring the engine has a command to process.
+
+### 4. In-memory books, durable outcomes
+
+Active order books live in memory inside the matching engine for speed.
+
+Durable state lives in PostgreSQL:
+
+- current order state
+- trade executions
+- immutable order events
+- idempotency records
+- processed command records for deduplication
+
+### 5. Same ordered path for submission and expiration
+
+Expiration must not bypass the engine and mutate live orders directly.
+
+Order submissions and expiration commands must both flow through the same symbol-partitioned command path.
+
+## Target Architecture
+
+The system is split into two deployable workloads plus two shared infrastructure dependencies.
+
+### Workloads
+
+- `broker-api`
+- `matching-engine`
+
+### Shared infrastructure
+
+- PostgreSQL
+- Kafka
 
 ## Main Components
 
@@ -79,325 +121,245 @@ Core modules:
 
 Responsibilities:
 
-- accept new orders
-- return an exchange order identifier
-- expose order status lookup
+- expose `POST /orders`
+- expose `GET /orders/{order_id}`
+- validate requests
+- enforce idempotency
+- persist accepted orders into PostgreSQL
+- publish `SubmitOrder` directly to Kafka keyed by `symbol`
+- serve reads directly from PostgreSQL
 
-Minimum endpoints:
+This service is stateless from the HTTP perspective and can scale horizontally behind a load balancer or an HPA.
 
-- `POST /orders`
-- `GET /orders/{order_id}`
+### Command bus
 
-Simplified payloads:
-
-`POST /orders` request
-
-```json
-{
-  "broker_id": "broker-123",
-  "document_number": "12345678900",
-  "side": "bid",
-  "symbol": "AAPL",
-  "price": 1050,
-  "quantity": 1000,
-  "valid_until": "2026-04-17T18:30:00Z"
-}
-```
-
-`POST /orders` response
-
-```json
-{
-  "order_id": "ord_01JXYZ123",
-  "status": "accepted"
-}
-```
-
-`GET /orders/{order_id}` response
-
-```json
-{
-  "order_id": "ord_01JXYZ123",
-  "broker_id": "broker-123",
-  "symbol": "AAPL",
-  "side": "bid",
-  "price": 1050,
-  "original_quantity": 1000,
-  "remaining_quantity": 400,
-  "status": "partially_filled",
-  "valid_until": "2026-04-17T18:30:00Z"
-}
-```
-
-### Validation and Intake
+Kafka is used as the ordered command path between the edge and the engine.
 
 Responsibilities:
 
-- validate required fields
-- validate side, symbol, price, quantity, and validity window
-- reject malformed or already expired orders
-- assign exchange-owned metadata such as internal sequence and acceptance time
+- preserve per-symbol ordering
+- allow independent scaling across symbols
+- decouple broker traffic from matching throughput
+- define the fixed parallelism of the engine tier
 
-This layer should also support idempotency so broker retries do not create duplicate orders.
+Every command is keyed by `symbol`, including:
 
-### Routing and Partitioning
+- `SubmitOrder`
+- `ExpireOrder`
 
-The system should not start with one physical process per stock.
+The topic should use a fixed number of partitions.
 
-Instead, it should start with:
+That partition count defines the maximum active parallelism of the matching tier:
 
-- `N` engine partitions
-- each partition owning many symbols
-- symbol-to-partition routing by deterministic hash
+- each partition can be owned by only one engine consumer at a time
+- one symbol always maps to one partition
+- adding engine replicas beyond the partition count improves availability, not throughput
 
-This gives concurrency across symbols while preserving a single ordered stream per symbol.
+### Matching engine
 
-If a symbol becomes very hot later, it can be promoted to a dedicated partition.
+Responsibilities:
 
-### Matching Engine
+- consume symbol-partitioned commands from Kafka
+- own in-memory order books for its assigned partitions
+- apply deterministic matching rules
+- persist updated order state, trades, and events
+- reject duplicate command processing safely
+- rebuild books from durable live state after restart
+- run the expiration scheduler for the system
 
-The engine is the core of the system.
+This service is internally stateful because it owns live in-memory books, but it remains horizontally scalable across Kafka partitions.
+
+Its scaling model is different from the API tier:
+
+- `broker-api` can autoscale freely based on HTTP load
+- `matching-engine` scales horizontally only up to the fixed partition count
+- each extra engine replica takes ownership of some partitions until all partitions are assigned
+
+### Embedded expiration scheduler
+
+There is no separate `expiration-worker` service in this version.
+
+Instead, `matching-engine` includes a scheduler component that:
+
+- periodically scans PostgreSQL for due open orders
+- acquires a lease or advisory lock so only one scheduler is active at a time
+- emits `ExpireOrder` commands to Kafka keyed by `symbol`
+
+The engine then handles those expiration commands through the same ordered path used for new orders.
+
+### Persistence layer
+
+PostgreSQL is the system of record.
+
+It stores:
+
+- `orders`
+- `trades`
+- `order_events`
+- `idempotency_keys`
+- `processed_commands`
+
+The design intentionally skips snapshots in the first version. On restart, the engine rebuilds books from durable live orders instead.
+
+## Matching Model
 
 Each symbol has:
 
 - a bid book
 - an ask book
 
-These should not be treated as in-memory databases. They should be treated as engine-owned in-memory ordered data structures.
+Each side should be modeled as:
 
-At a high level:
-
-- the bid book contains buy orders
-- the ask book contains sell orders
-- the bid side is ordered by highest price first, then earliest accepted order first
-- the ask side is ordered by lowest price first, then earliest accepted order first
-
-A practical internal model is:
-
-- one order book per symbol
-- two sides inside the book: bids and asks
-- each side implemented as a sorted price index
-- each price level containing a FIFO queue of orders
-
-Example shape:
-
-- bids
-- `10.50 -> [order1, order2]`
-- `10.25 -> [order3]`
-- asks
-- `10.75 -> [order4]`
-- `11.00 -> [order5, order6]`
-
-This structure gives the engine the operations it needs efficiently:
-
-- get the best bid from the highest active bid price level
-- get the best ask from the lowest active ask price level
-- preserve time priority within the same price level using FIFO order
-
-The engine will also typically maintain supporting in-memory indexes such as:
-
-- `order_id -> order record`
-- `order_id -> location in the book`
-
-These indexes are useful for fast status lookup inside the engine and become especially important once cancel and replace operations are added.
+- an ordered price index
+- a FIFO queue per price level
 
 Matching rules:
 
 - only orders for the same symbol can match
-- bids are prioritized by highest price, then earliest accepted order
-- asks are prioritized by lowest price, then earliest accepted order
+- bids are prioritized by highest price, then earliest processed order
+- asks are prioritized by lowest price, then earliest processed order
 - a trade occurs when best bid is greater than or equal to best ask
-- execution price is the seller price
+- execution price is always the seller price
 - partial fills are allowed
 - remaining quantity stays active until filled or expired
 
-Because matching is stateful and order-sensitive, all mutations to a symbol book should happen only inside the engine partition that owns that symbol.
+Supporting in-memory indexes should include:
 
-### Persistence Layer
+- `order_id -> order state`
+- `order_id -> book location`
 
-The persistence layer stores:
+All price and quantity values should be stored as integers, never floating-point numbers.
 
-- current order state
-- trade executions
-- immutable order events
-- engine snapshots or recovery checkpoints
+## End-to-End Flows
 
-At minimum, it should support:
+### Order submission and matching flow
 
-- durable storage of accepted orders
-- storage of every execution event
-- enough state to rebuild or replay the engine after a crash
+1. Broker sends `POST /orders` to `broker-api`.
+2. The API validates the request and checks idempotency.
+3. The API writes the order row and idempotency row in PostgreSQL.
+4. The API publishes `SubmitOrder` directly to Kafka keyed by `symbol`.
+5. The API returns `202 Accepted` with the public `order_id`.
+6. The owning `matching-engine` consumer receives the command.
+7. The engine ignores it if that command was already processed.
+8. The engine loads or initializes the symbol book.
+9. The engine applies price-time-priority matching.
+10. The engine persists trades, events, updated order state, and processed-command markers.
+11. `GET /orders/{order_id}` returns the latest persisted state from PostgreSQL.
 
-### Read Model / Query Layer
+### Order query flow
 
-This layer exists to serve brokers efficiently.
+1. Broker requests `GET /orders/{order_id}`.
+2. `broker-api` reads current order state and trade summary directly from PostgreSQL.
+3. The system returns the persisted status and remaining quantity.
 
-Responsibilities:
+### Expiration flow
 
-- return current order status by order id
-- return fill details or execution history
-- support future operational dashboards and reporting
+1. The embedded scheduler in `matching-engine` scans for due live orders.
+2. It acquires a lease so only one scheduler instance emits commands.
+3. It publishes `ExpireOrder` commands to Kafka keyed by `symbol`.
+4. The owning engine consumer processes the command in symbol order.
+5. The engine verifies the order is still open and actually expired.
+6. The engine persists the expiration event and updated order state.
 
-This should be isolated from the hot write path so heavy reads do not interfere with matching throughput.
+## Consistency Model
 
-### Expiration Worker
+The system separates acceptance consistency from matching consistency.
 
-Orders include a validity deadline, so the system needs expiration handling.
+### Synchronous guarantee
 
-The design should use two protections:
+When `POST /orders` returns success:
 
-- a background expiration process that marks orders expired
-- an in-engine validation check before any match is executed
+- the order exists in PostgreSQL
+- the `SubmitOrder` command has been accepted by Kafka
+- the broker has a valid exchange order identifier
+- the system can recover and continue processing after crash
 
-This prevents stale orders from executing because of scheduler lag.
+### Asynchronous guarantee
 
+Matching happens after acceptance through Kafka.
 
-## Order Lifecycle
+That means:
 
-### Submission flow
+- `GET /orders/{order_id}` may briefly return `accepted`
+- reads are eventually consistent relative to matching
+- once processed, the order transitions into `open`, `partially_filled`, `filled`, or `expired`
 
-1. Broker submits an order through the API.
-2. Intake validates the payload and broker-level metadata.
-3. The system assigns an order identifier and internal sequence metadata.
-4. The order is routed to the owning partition for its symbol.
-5. The engine tries to match it immediately against the opposite side of the book.
-6. The engine emits zero or more executions.
-7. Any unfilled quantity is stored as a resting order if still valid.
-8. The resulting state is persisted.
-9. The API responds with the order identifier and current status.
+This is an intentional tradeoff. It keeps the edge fast while preserving deterministic matching at scale.
 
-### Query flow
+### Simplification tradeoff
 
-1. Broker requests an order by identifier.
-2. The query layer reads the current order state from persisted storage or a read projection.
-3. The system returns status, remaining quantity, and execution summary.
+This version intentionally avoids an outbox to keep the architecture smaller.
 
-## Data Model
+That means the broker API performs a direct PostgreSQL plus Kafka write on submission.
 
-At a high level, the system needs four data categories.
+This is simpler to build and explain, but it introduces a dual-write tradeoff that would need stronger mitigation in a more production-hardened design.
 
-### Orders
+## Failure Handling and Recovery
 
-Represents current order state.
+### Broker API failure
 
-Fields should include:
+If `broker-api` crashes before the acceptance transaction commits, the order is not accepted.
 
-- order id
-- broker id
-- owner document number
-- side
-- symbol
-- limit price
-- original quantity
-- remaining quantity
-- valid until
-- status
-- accepted timestamp
-- internal sequence number
+If it crashes after commit but before the client receives the response, retry safety comes from idempotency.
 
-### Trades
+### Broker API publish failure
 
-Represents each execution.
+If the order is persisted in PostgreSQL but Kafka publish fails, the broker API should return an error and rely on broker retry plus idempotency.
 
-Fields should include:
+This is one of the tradeoffs of removing the outbox from the design.
 
-- trade id
-- buy order id
-- sell order id
-- symbol
-- executed quantity
-- execution price
-- execution timestamp
-- execution sequence
+### Matching engine failure
 
-### Order Events
+If a `matching-engine` instance crashes:
 
-Represents the immutable lifecycle trail.
+- Kafka reassigns its partitions
+- another instance takes ownership
+- the new owner rebuilds books from live open orders in PostgreSQL
+- command consumption resumes from Kafka
 
-Examples:
+### Duplicate expiration commands
 
-- order accepted
-- partially filled
-- fully filled
-- expired
-- rejected
-- canceled
-- replaced
+Even if the scheduler emits the same expiration command more than once:
 
-### Engine Snapshots
+- the engine checks whether the order is still open
+- the engine checks whether it is truly expired
+- processed-command deduplication prevents repeated state transitions
 
-Represents recovery state for each partition or symbol group.
+## Why This Design Scales
 
-Used to restore in-memory books quickly without replaying all historical events from the beginning.
+The main scalability advantages are:
 
-## Why This Design Is Performant
+- broker traffic scales independently from matching throughput
+- `broker-api` can autoscale horizontally based on HTTP load
+- `matching-engine` scales horizontally by distributing a fixed number of partitions across replicas
+- symbols are distributed across Kafka partitions for parallelism
+- one writer per symbol avoids global locking
+- active books stay in memory on the hot path
+- reads stay off engine internals
 
-The main performance advantages are architectural:
+## Why This Design Is Simpler
 
-- active books stay in memory
-- there is no lock contention inside a symbol stream
-- matching avoids synchronous cross-service calls
-- writes are localized to a partition owner
-- reads are separated from matching
+Compared with the earlier version, this design removes complexity in three places:
 
-This design is also efficient under uneven traffic because multiple symbols can share the same partition until a hot symbol needs isolation.
+- `broker-api` publishes directly to Kafka
+- the expiration scheduler is embedded in `matching-engine`
+- reads come directly from PostgreSQL instead of a separate query service
 
-## Why This Design Is Robust
+That keeps the important exchange invariants while reducing operational surface area.
 
-The main robustness advantages are:
+## Evolution Path
 
-- deterministic sequencing
-- explicit ownership of book mutation
-- durable storage of state transitions
-- clear recovery path
-- idempotent submission support
-- built-in expiration enforcement
+If scale or team boundaries justify it later, this design can evolve by:
 
-The key idea is that correctness comes from controlled ordering, and recovery comes from durable events plus snapshots.
+- introducing an outbox if stronger publish guarantees are required
+- extracting `expiration-worker` into its own service
+- introducing a dedicated read model
+- adding snapshots for faster engine recovery
+- isolating hot symbols onto dedicated partitions
 
-## Future Architecture Roadmap
+Those changes preserve the same core invariants:
 
-This section focuses on the core system architecture only.
-
-### V1: Must-Have for Initial Delivery
-
-The first version should include the minimum architecture required to be correct, fast, and testable.
-
-#### Core engine
-
-- single active writer per symbol
-- partitioned matching engine
-- in-memory bid and ask books
-- deterministic price-time priority
-- partial fill support
-- seller-price execution rule
-
-#### Core API
-
-- order submission endpoint
-- order status endpoint
-- exchange-generated order identifiers
-- basic idempotency support for retries
-
-#### Persistence
-
-- durable order storage
-- durable trade storage
-- persisted order statuses
-- immutable event records for key transitions
-
-#### Operations
-
-- containerized runtime
-- startup migrations or schema initialization
-- health and readiness endpoints
-- structured logging
-- baseline metrics
-
-#### Testing
-
-- deterministic matching tests
-- chronological priority tests
-- partial fill tests
-- expiry tests
-- duplicate submission tests
+- single writer per symbol
+- ordered command handling
+- durable acceptance
+- in-memory matching with durable outcomes
