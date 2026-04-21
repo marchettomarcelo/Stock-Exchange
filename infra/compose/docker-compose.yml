@@ -1,0 +1,170 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: decade
+      POSTGRES_PASSWORD: decade
+      POSTGRES_USER: decade
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U decade -d decade"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  kafka:
+    image: confluentinc/cp-kafka:7.7.0
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://kafka:9092,CONTROLLER://kafka:29093,EXTERNAL://0.0.0.0:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_NODE_ID: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "kafka-topics --bootstrap-server localhost:9094 --list >/dev/null 2>&1"
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+    ports:
+      - "9094:9094"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+  topic-init:
+    image: confluentinc/cp-kafka:7.7.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        kafka-topics --bootstrap-server kafka:9092 \
+          --create \
+          --if-not-exists \
+          --topic "$${KAFKA_COMMANDS_TOPIC}" \
+          --partitions "$${KAFKA_COMMANDS_PARTITIONS}" \
+          --replication-factor 1
+        CURRENT_PARTITIONS=$$(kafka-topics --bootstrap-server kafka:9092 \
+          --describe \
+          --topic "$${KAFKA_COMMANDS_TOPIC}" | awk -F'PartitionCount:' 'NR==1 {split($$2, values, " "); print values[1]}')
+        if [ "$$CURRENT_PARTITIONS" -lt "$${KAFKA_COMMANDS_PARTITIONS}" ]; then
+          kafka-topics --bootstrap-server kafka:9092 \
+            --alter \
+            --if-exists \
+            --topic "$${KAFKA_COMMANDS_TOPIC}" \
+            --partitions "$${KAFKA_COMMANDS_PARTITIONS}"
+        fi
+    environment:
+      KAFKA_COMMANDS_PARTITIONS: ${KAFKA_COMMANDS_PARTITIONS:-2}
+      KAFKA_COMMANDS_TOPIC: ${KAFKA_COMMANDS_TOPIC:-exchange.commands}
+
+  migrate:
+    profiles: ["tools"]
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.broker-api
+    command: ["pnpm", "exec", "tsx", "db/scripts/apply-migrations.ts"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://decade:decade@postgres:5432/decade
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CLIENT_ID: migrate
+      KAFKA_COMMANDS_TOPIC: exchange.commands
+      LOG_LEVEL: info
+      SERVICE_NAME: migrate
+
+  broker-api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.broker-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://decade:decade@postgres:5432/decade
+      DATABASE_MAX_CONNECTIONS: "10"
+      BROKER_ID: broker-api
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CLIENT_ID: broker-api
+      KAFKA_COMMANDS_PARTITIONS: ${KAFKA_COMMANDS_PARTITIONS:-2}
+      KAFKA_COMMANDS_TOPIC: ${KAFKA_COMMANDS_TOPIC:-exchange.commands}
+      KAFKA_SSL: "false"
+      LOG_LEVEL: info
+      PORT: "3000"
+      SERVICE_NAME: broker-api
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  broker-api-proxy:
+    image: haproxy:3.1-alpine
+    depends_on:
+      broker-api:
+        condition: service_started
+    ports:
+      - "3000:3000"
+    volumes:
+      - ../haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    restart: unless-stopped
+
+  matching-engine:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.matching-engine
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://decade:decade@postgres:5432/decade
+      DATABASE_MAX_CONNECTIONS: "10"
+      EXPIRATION_LEASE_NAME: expiration-scheduler
+      EXPIRATION_SCAN_INTERVAL_MS: "1000"
+      EXPIRATION_SCAN_LIMIT: "100"
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CLIENT_ID: matching-engine
+      KAFKA_COMMANDS_PARTITIONS: ${KAFKA_COMMANDS_PARTITIONS:-2}
+      KAFKA_COMMANDS_TOPIC: ${KAFKA_COMMANDS_TOPIC:-exchange.commands}
+      KAFKA_CONSUMER_GROUP_ID: ${KAFKA_CONSUMER_GROUP_ID:-matching-engine}
+      KAFKA_SSL: "false"
+      LOG_LEVEL: info
+      PORT: "3001"
+      SERVICE_NAME: matching-engine
+    expose:
+      - "3001"
+    restart: unless-stopped
+
+volumes:
+  kafka_data:
+  postgres_data:

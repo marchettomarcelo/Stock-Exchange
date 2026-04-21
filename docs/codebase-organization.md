@@ -1,66 +1,26 @@
-# Codebase Organization Proposal
+# Codebase Organization
 
-## Purpose
+## Overview
 
-This document defines how the codebase should be organized to implement the lean scalable exchange architecture described in [high-level-system-design.md](/Users/marcelomarchetto/Desktop/decade/docs/high-level-system-design.md).
+This project is easiest to build and maintain as a small monorepo with two deployable applications and a small set of shared packages.
 
-The main simplifications compared with the earlier proposal are:
+The goal of this structure is straightforward:
 
-- two deployable applications instead of four
-- direct publish from `broker-api` to Kafka
-- no separate expiration worker
-- no separate query service
-- a smaller shared-library surface
+- keep deployable services easy to find
+- keep matching logic isolated from transport and storage code
+- make shared contracts explicit
+- let the API tier and engine tier evolve independently without duplicating core logic
 
-The goal is to keep the architecture scalable without turning the first build into an unnecessarily fragmented distributed system.
-
-## Target Architecture
-
-The target implementation stack is:
-
-- NestJS for application composition and transport adapters
-- TypeScript for all application and domain code
-- PostgreSQL as the system of record
-- Kafka as the ordered command bus
-- a monorepo with two deployable applications
-
-The two deployable applications are:
+The main applications are:
 
 - `broker-api`
 - `matching-engine`
 
-## Architectural Direction
+The shared packages support those two applications without turning the repository into a large framework.
 
-The system should be implemented as a small service-oriented monorepo.
+## Repository Shape
 
-### `broker-api`
-
-This application owns:
-
-- HTTP endpoints
-- validation
-- idempotent order acceptance
-- direct Kafka publish for `SubmitOrder`
-- direct order-status reads from PostgreSQL
-
-### `matching-engine`
-
-This application owns:
-
-- Kafka command consumption
-- partition ownership
-- in-memory order books
-- deterministic matching
-- persistence of trades and order state
-- processed-command deduplication
-- an embedded expiration scheduler
-
-This keeps the physical architecture small while preserving the correct scalability boundary:
-
-- `broker-api` scales by HTTP load and can autoscale horizontally
-- `matching-engine` scales by partition ownership up to a fixed partition count
-
-## Recommended Repository Layout
+The intended layout is:
 
 ```text
 .
@@ -104,87 +64,157 @@ This keeps the physical architecture small while preserving the correct scalabil
 └── eslint.config.mjs
 ```
 
-## Why This Layout
+At a glance:
 
-### `apps/`
+- `apps/` contains deployable entrypoints
+- `packages/` contains shared code with clear boundaries
+- `db/` contains schema migrations and seeds
+- `infra/` contains local and container runtime setup
+- `docs/` contains design and onboarding material
 
-`apps/` should contain deployable entrypoints only.
+## Applications
 
-- `broker-api` is the broker-facing HTTP service
-- `matching-engine` is the internal worker service
+### `apps/broker-api`
 
-### `packages/`
+This is the broker-facing HTTP service.
 
-`packages/` should contain shared code with clear responsibilities.
+It should own:
 
-- `exchange-core` keeps the matching logic pure
-- `application` holds use cases and orchestration
-- `infrastructure` hides PostgreSQL, Kafka, config, and logging details
-- `contracts` defines HTTP and message payloads
-- `testing` centralizes fixtures and helpers
+- request validation
+- idempotent order submission
+- PostgreSQL writes for accepted orders
+- Kafka publish for `SubmitOrder`
+- direct reads for `GET /orders/{order_id}`
+- health and readiness endpoints
 
-### `infra/`
+This app should stay stateless between requests.
 
-`infra/` should stay small.
+### `apps/matching-engine`
 
-- Dockerfiles for the two applications
-- a local `docker-compose.yml` for PostgreSQL, Kafka, and the apps
+This is the internal worker that owns live matching.
 
-Kubernetes manifests can be added later if needed, but they should not drive the initial repo structure.
+It should own:
 
-## Package Responsibilities
+- Kafka command consumption
+- partition ownership
+- in-memory order books
+- deterministic matching
+- trade and order-state persistence
+- processed-command deduplication
+- the expiration scheduler
+- health and readiness endpoints
+
+This app is stateful at runtime because it owns live books in memory, but that state is rebuilt from durable data after restart.
+
+## Shared Packages
 
 ### `packages/exchange-core`
 
-This package should contain the pure exchange engine with no NestJS or infrastructure dependencies.
+This package contains the pure exchange engine.
 
-Contents:
+It should include:
 
 - `OrderBook`
 - bid-side and ask-side structures
 - matching policies
 - execution generation
 - expiration checks
-- value objects and domain errors
+- value objects
+- domain errors
 
-Rules:
+Rules for this package:
 
-- no SQL
+- no NestJS dependencies
+- no SQL or repository code
 - no Kafka client code
-- no HTTP code
+- no HTTP concerns
 - use integers for price and quantity
+
+If someone wants to understand the matching algorithm, this is the first package they should read.
 
 ### `packages/application`
 
-This package should contain use cases and orchestration logic shared by the two apps.
+This package contains use cases and orchestration that sit between the pure domain and the adapters.
 
-Contents:
+It should include:
 
 - `SubmitOrder`
 - `GetOrderStatus`
-- direct publish orchestration
 - `ProcessOrderCommand`
 - `ProcessExpireCommand`
 - expiration scan orchestration
-- idempotency handling
+- idempotency rules
 - processed-command deduplication rules
 
-This package should depend on interfaces, not concrete drivers.
+This package should depend on interfaces rather than concrete drivers.
 
 ### `packages/infrastructure`
 
-This package should contain adapters for external systems.
+This package contains adapters for external systems.
 
-Contents:
+It should include:
 
 - PostgreSQL repositories
 - transaction helpers
 - Kafka producer and consumer adapters
 - lease or advisory-lock helpers
-- config parsing
-- logger and metrics wiring
+- configuration loading
+- logger wiring
+- metrics wiring
 
-Suggested tables:
+This is the package that knows how the system talks to PostgreSQL and Kafka.
+
+### `packages/contracts`
+
+This package defines the messages and schemas shared across boundaries.
+
+It should include:
+
+- HTTP request and response schemas
+- `SubmitOrder` command payloads
+- `ExpireOrder` command payloads
+- query DTOs
+- shared enums and status shapes
+
+This package should stay small and stable because it defines the system's external and internal contracts.
+
+### `packages/testing`
+
+This package centralizes reusable test support.
+
+It should include:
+
+- order fixture builders
+- fake clock utilities
+- PostgreSQL integration helpers
+- Kafka integration helpers
+- deterministic engine assertions
+
+This keeps tests consistent without spreading custom helpers across every app.
+
+## Dependency Direction
+
+The most important dependency rule is simple:
+
+- the matching core must not know about HTTP, Kafka client APIs, or PostgreSQL
+
+The rest of the dependency direction should follow these rules:
+
+- `apps/*` may depend on `packages/*`
+- `exchange-core` must not depend on the other packages
+- `application` may depend on `exchange-core` and `contracts`
+- `application` should talk to storage and messaging through interfaces
+- `infrastructure` may depend on `application` and `contracts`
+- `contracts` should not depend on framework-specific infrastructure
+- `testing` may depend on any package needed for test support
+
+These boundaries make it possible to test matching behavior in isolation and replace adapters without rewriting domain logic.
+
+## Persistence Layout
+
+The database exists to support durable order acceptance, matching recovery, and broker-facing reads.
+
+The main tables are:
 
 - `orders`
 - `trades`
@@ -192,199 +222,104 @@ Suggested tables:
 - `idempotency_keys`
 - `processed_commands`
 
-### `packages/contracts`
+Their responsibilities are:
 
-This package should define transport and integration contracts.
-
-Contents:
-
-- HTTP request and response schemas
-- `SubmitOrder` command payload
-- `ExpireOrder` command payload
-- query DTOs
-
-### `packages/testing`
-
-This package should centralize test helpers.
-
-Contents:
-
-- order fixture builders
-- fake clock
-- PostgreSQL integration helpers
-- Kafka integration helpers
-- deterministic engine assertions
-
-## Application Composition
-
-### `apps/broker-api`
-
-This app should compose:
-
-1. `contracts`
-2. `application`
-3. `infrastructure`
-
-Key responsibilities:
-
-- expose `POST /orders`
-- expose `GET /orders/:orderId`
-- validate and normalize requests
-- persist accepted orders in PostgreSQL
-- publish `SubmitOrder` directly to Kafka
-- return persisted order status to brokers
-
-This app must remain stateless between HTTP requests.
-
-### `apps/matching-engine`
-
-This app should compose:
-
-1. `exchange-core`
-2. `application`
-3. `infrastructure`
-4. `contracts`
-
-Key responsibilities:
-
-- consume Kafka partitions
-- own symbol books for assigned partitions
-- apply deterministic matching rules
-- persist trades, events, and updated order state
-- record processed commands for idempotency
-- run the embedded expiration scheduler
-
-This app is not externally reachable by brokers.
-
-## Dependency Rules
-
-The codebase should follow these dependency rules:
-
-- `apps/*` may depend on `packages/*`
-- `exchange-core` must not depend on NestJS, Kafka, or SQL
-- `application` may depend on `exchange-core` and `contracts`
-- `application` should interact with storage and messaging through interfaces
-- `infrastructure` may depend on `application`, `contracts`, and environment libraries
-- `contracts` must not depend on NestJS infrastructure
-- `testing` may depend on any package needed for test support
-
-The most important boundary is still this:
-
-- the matching engine core must never know about HTTP, Kafka client APIs, or PostgreSQL
-
-## Persistence Strategy
-
-The database should be organized for durable acceptance, matching recovery, and direct reads.
-
-Recommended choices:
-
-- PostgreSQL as the primary system of record
-- writes for accepted orders and idempotency records
-- transactional writes for trade persistence and order-state updates
-- direct reads for `GET /orders/:orderId`
-- indexes for `order_id`, `symbol`, `status`, and `valid_until`
-
-Storage responsibilities:
-
-- `orders` stores current order state
+- `orders` stores the current state of each order
 - `trades` stores every execution
-- `order_events` stores the lifecycle trail
+- `order_events` stores the order lifecycle trail
 - `idempotency_keys` protects broker retries
-- `processed_commands` prevents duplicate engine effects
+- `processed_commands` prevents duplicate engine side effects
 
-The initial version should not introduce snapshots. Engine recovery should rebuild books from currently open orders.
+Direct reads for `GET /orders/{order_id}` should come from PostgreSQL rather than from live engine memory.
 
-## Messaging Strategy
+## Messaging Layout
 
-Kafka should be used narrowly and intentionally.
+Kafka is used narrowly as the ordered command bus between the API and matching engine.
 
-Responsibilities:
+The main rules are:
 
-- carry `SubmitOrder` and `ExpireOrder` commands
-- preserve per-symbol ordering
-- allow horizontal engine scale by partition ownership
-
-Important rules:
-
-- always key commands by `symbol`
+- publish `SubmitOrder` and `ExpireOrder`
+- always key messages by `symbol`
 - assume at-least-once delivery
-- make engine command handlers idempotent
-- keep command payloads minimal and stable
-- use a fixed partition count to define engine-tier parallelism
+- make engine handlers idempotent
+- keep payloads minimal and stable
+- use a fixed partition count to define engine parallelism
 
-That fixed partition count sets the upper bound of active matching parallelism:
-
-- each partition has only one active owner at a time
-- one symbol always maps to one partition
-- adding engine replicas beyond the partition count improves availability, not throughput
+That partition count is an architectural setting, not just a Kafka detail. It decides how much matching work can run in parallel.
 
 ## Runtime Model
 
-### Broker API runtime
+### `broker-api` runtime
 
-- run as a stateless deployment
-- scale horizontally behind a load balancer or HPA
-- publish `SubmitOrder` directly to Kafka
-- read from PostgreSQL directly
+- runs as a stateless deployment
+- scales with HTTP traffic
+- reads from PostgreSQL directly
+- publishes commands to Kafka directly
 
-### Matching engine runtime
+### `matching-engine` runtime
 
-- run as a deployment with multiple replicas
-- consume Kafka partitions via a consumer group
-- let Kafka assign partition ownership
-- scale only up to the configured partition count
-- run exactly one expiration scheduler at a time using a lease or advisory lock
+- runs as a worker deployment
+- consumes Kafka partitions in a consumer group
+- owns symbol books for its assigned partitions
+- scales only up to the Kafka partition count
+- runs exactly one active expiration scheduler using a lease or advisory lock
 
-This is why a `Deployment` is enough here. Stable pod identity is less important than consumer-group ownership.
+This split keeps the operational model easy to reason about: the API handles ingress and reads, while the engine handles ordered state transitions.
 
 ## Testing Strategy
 
-Recommended stack:
+The repository should support four levels of testing.
 
-- Vitest for unit and integration tests
-- Nest testing utilities for app bootstrapping
-- Supertest for HTTP e2e coverage
-- Testcontainers for PostgreSQL and Kafka-backed tests
-- `fast-check` for matching invariants
+### Unit tests
 
-Minimum test suites:
+Focus on `exchange-core`:
 
 - price-time priority
 - seller-price execution
 - partial fills
-- expired order rejection
-- idempotent API retries
+- expiration checks
+
+### Application tests
+
+Focus on orchestration:
+
+- idempotent submission
 - duplicate command handling
-- per-symbol ordered processing
-- engine recovery by rebuilding from open orders
+- order-state transitions
 
-## Implementation Notes
+### Integration tests
 
-A few constraints should be treated as non-negotiable:
+Focus on adapters:
 
-- money and quantity values must be integers
-- acceptance must be durable before returning success
-- matching must remain single-writer per symbol
-- reads must not inspect live in-memory books
-- expiration must use the same ordered path as submission
-- duplicate command delivery must be safe
-- the API tier and engine tier must have independent scaling policies
+- PostgreSQL persistence
+- Kafka publish and consume behavior
+- engine recovery from durable open orders
 
-This design intentionally accepts a direct PostgreSQL plus Kafka write on submission.
+### End-to-end tests
 
-That keeps the codebase smaller, but it introduces a dual-write tradeoff that should be discussed explicitly.
+Focus on the broker-facing behavior:
 
-## Recommended First Milestone
+- `POST /orders`
+- `GET /orders/{order_id}`
+- asynchronous transition from accepted to matched or expired
 
-The first implementation slice should create:
+Recommended tooling:
 
-1. monorepo scaffolding with `apps/broker-api` and `apps/matching-engine`
-2. a pure `exchange-core` package with deterministic matching tests
-3. PostgreSQL persistence for orders, trades, events, idempotency, and processed commands
-4. Kafka setup with symbol-keyed commands
-5. `POST /orders` and `GET /orders/:orderId` in `broker-api`
-6. command consumption and matching in `matching-engine`
-7. direct publish from `broker-api` and the embedded expiration scheduler
-8. Dockerfiles and local compose infrastructure
+- Vitest
+- Nest testing utilities
+- Supertest
+- Testcontainers
+- `fast-check` for matching invariants
 
-That gives a scalable design with fewer moving parts and a codebase shape that is practical to implement.
+## How To Read The Codebase
+
+For a first pass through the repository, this order works well:
+
+1. Read `docs/high-level-system-design.md` to understand the runtime model.
+2. Read `packages/contracts` to see the system inputs and outputs.
+3. Read `packages/exchange-core` to understand matching behavior.
+4. Read `packages/application` to see how commands and use cases are orchestrated.
+5. Read `apps/broker-api` and `apps/matching-engine` to see how the system is composed at runtime.
+6. Read `packages/infrastructure` last to understand PostgreSQL, Kafka, and operational wiring.
+
+That path moves from system behavior to implementation details without mixing concerns too early.

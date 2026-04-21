@@ -1,0 +1,42 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "strict": true,
+    "strictNullChecks": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "composite": true,
+    "incremental": true,
+    "esModuleInterop": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "types": [
+      "node"
+    ],
+    "baseUrl": ".",
+    "paths": {
+      "@decade/application": [
+        "packages/application/src"
+      ],
+      "@decade/contracts": [
+        "packages/contracts/src"
+      ],
+      "@decade/exchange-core": [
+        "packages/exchange-core/src"
+      ],
+      "@decade/infrastructure": [
+        "packages/infrastructure/src"
+      ],
+      "@decade/testing": [
+        "packages/testing/src"
+      ]
+    }
+  }
+}
+

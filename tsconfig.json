@@ -1,0 +1,29 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "./db"
+    },
+    {
+      "path": "./packages/exchange-core"
+    },
+    {
+      "path": "./packages/contracts"
+    },
+    {
+      "path": "./packages/application"
+    },
+    {
+      "path": "./packages/infrastructure"
+    },
+    {
+      "path": "./packages/testing"
+    },
+    {
+      "path": "./apps/broker-api"
+    },
+    {
+      "path": "./apps/matching-engine"
+    }
+  ]
+}

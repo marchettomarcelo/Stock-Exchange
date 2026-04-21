@@ -1,0 +1,13 @@
+export const APP_CONFIG = Symbol("APP_CONFIG");
+export const LOGGER = Symbol("LOGGER");
+export const CLOCK = Symbol("CLOCK");
+export const ID_GENERATOR = Symbol("ID_GENERATOR");
+export const REQUEST_HASHER = Symbol("REQUEST_HASHER");
+export const POSTGRES_POOL = Symbol("POSTGRES_POOL");
+export const ORDER_REPOSITORY = Symbol("ORDER_REPOSITORY");
+export const IDEMPOTENCY_REPOSITORY = Symbol("IDEMPOTENCY_REPOSITORY");
+export const TRANSACTION_MANAGER = Symbol("TRANSACTION_MANAGER");
+export const KAFKA_CLIENT = Symbol("KAFKA_CLIENT");
+export const COMMAND_PUBLISHER = Symbol("COMMAND_PUBLISHER");
+export const SUBMIT_ORDER_USE_CASE = Symbol("SUBMIT_ORDER_USE_CASE");
+export const GET_ORDER_STATUS_USE_CASE = Symbol("GET_ORDER_STATUS_USE_CASE");

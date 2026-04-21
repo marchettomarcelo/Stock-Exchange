@@ -1,0 +1,40 @@
+import { Module } from "@nestjs/common";
+
+import { runtimeProviders } from "./runtime.providers";
+import {
+  APP_CONFIG,
+  CLOCK,
+  COMMAND_CONSUMER,
+  COMMAND_PUBLISHER,
+  ID_GENERATOR,
+  LEASE_MANAGER,
+  LOGGER,
+  ORDER_EVENT_REPOSITORY,
+  ORDER_REPOSITORY,
+  POSTGRES_POOL,
+  PROCESSED_COMMAND_REPOSITORY,
+  SYMBOL_ORDER_BOOKS,
+  TRADE_REPOSITORY,
+  TRANSACTION_MANAGER
+} from "./runtime.tokens";
+
+@Module({
+  providers: runtimeProviders,
+  exports: [
+    APP_CONFIG,
+    CLOCK,
+    COMMAND_CONSUMER,
+    COMMAND_PUBLISHER,
+    ID_GENERATOR,
+    LEASE_MANAGER,
+    LOGGER,
+    ORDER_EVENT_REPOSITORY,
+    ORDER_REPOSITORY,
+    POSTGRES_POOL,
+    PROCESSED_COMMAND_REPOSITORY,
+    SYMBOL_ORDER_BOOKS,
+    TRADE_REPOSITORY,
+    TRANSACTION_MANAGER
+  ]
+})
+export class RuntimeModule {}

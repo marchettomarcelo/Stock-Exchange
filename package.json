@@ -1,0 +1,35 @@
+{
+  "name": "decade",
+  "private": true,
+  "packageManager": "pnpm@9.15.4",
+  "scripts": {
+    "build": "tsc -b",
+    "compose:apps:up": "BROKER_API_INSTANCES=${BROKER_API_INSTANCES:-2} MATCHING_ENGINE_INSTANCES=${MATCHING_ENGINE_INSTANCES:-2} KAFKA_COMMANDS_PARTITIONS=${KAFKA_COMMANDS_PARTITIONS:-2} docker compose -f infra/compose/docker-compose.yml up --build -d --scale broker-api=$BROKER_API_INSTANCES --scale matching-engine=$MATCHING_ENGINE_INSTANCES broker-api-proxy broker-api matching-engine",
+    "compose:down": "docker compose -f infra/compose/docker-compose.yml down -v",
+    "compose:infra:up": "docker compose -f infra/compose/docker-compose.yml up -d postgres kafka",
+    "compose:logs": "docker compose -f infra/compose/docker-compose.yml logs -f",
+    "compose:migrate": "docker compose -f infra/compose/docker-compose.yml --profile tools run --rm migrate",
+    "db:migrate": "tsx db/scripts/apply-migrations.ts",
+    "db:reset": "tsx db/scripts/reset-database.ts",
+    "lint": "eslint .",
+    "sharding:report": "corepack pnpm --filter @decade/testing sharding:report",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev:broker-api": "pnpm --filter @decade/broker-api dev",
+    "dev:matching-engine": "pnpm --filter @decade/matching-engine dev"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.15.6",
+    "@typescript-eslint/eslint-plugin": "^8.18.2",
+    "@typescript-eslint/parser": "^8.18.2",
+    "eslint": "^9.17.0",
+    "globals": "^15.14.0",
+    "pg": "^8.16.3",
+    "pg-mem": "^3.0.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

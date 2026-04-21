@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json.schemastore.org/nest-cli",
+  "collection": "@nestjs/schematics",
+  "monorepo": true,
+  "projects": {
+    "broker-api": {
+      "type": "application",
+      "root": "apps/broker-api",
+      "entryFile": "main",
+      "sourceRoot": "apps/broker-api/src"
+    },
+    "matching-engine": {
+      "type": "application",
+      "root": "apps/matching-engine",
+      "entryFile": "main",
+      "sourceRoot": "apps/matching-engine/src"
+    }
+  }
+}
+
