@@ -1,112 +1,37 @@
 # Codebase Organization
 
+Note: `docs/engineering-case-marcelo.md` is deleted in the current working tree, so this document is based on the last committed version of that spec (`git show HEAD:docs/engineering-case-marcelo.md`) plus the current codebase.
+
 ## Overview
 
-This repository is a TypeScript monorepo for a small exchange system with two deployable applications:
+This repository is a TypeScript monorepo for the exchange system described in [`high-level-system-design.md`](./high-level-system-design.md).
 
-- `broker-api`
-- `matching-engine`
+The main source of truth is under `apps/*/src`, `packages/*/src`, `db/`, and `infra/`. The repo also contains generated `dist/` output and `tsconfig.tsbuildinfo` files for the workspace packages and apps.
 
-The codebase is organized around a few shared packages:
-
-- `contracts` defines request, response, and command schemas
-- `exchange-core` contains the matching engine domain logic
-- `application` contains use cases, records, ports, and the current Kafka/PostgreSQL-facing classes used by the apps
-- `infrastructure` contains runtime factories and environment-specific helpers
-- `testing` contains reusable fixtures and Kafka sharding helpers
-
-The repository currently also checks in generated `dist/` output and `tsconfig.tsbuildinfo` files for apps, packages, and the `db` project.
-
-## Repository Shape
-
-This is the current high-level layout:
+## Top-Level Layout
 
 ```text
 .
-├── apps
-│   ├── broker-api
-│   │   ├── src
-│   │   │   ├── app.module.ts
-│   │   │   ├── main.ts
-│   │   │   ├── health/
-│   │   │   ├── orders/
-│   │   │   ├── publishing/
-│   │   │   └── runtime/
-│   │   ├── test/
-│   │   └── dist/
-│   └── matching-engine
-│       ├── src
-│       │   ├── app.module.ts
-│       │   ├── main.ts
-│       │   ├── engine/
-│       │   ├── expiration/
-│       │   ├── health/
-│       │   └── runtime/
-│       ├── test/
-│       └── dist/
-├── packages
-│   ├── application
-│   │   ├── src
-│   │   │   ├── kafka/
-│   │   │   ├── ports/
-│   │   │   ├── postgres/
-│   │   │   ├── use-cases/
-│   │   │   ├── messages.ts
-│   │   │   ├── records.ts
-│   │   │   └── symbol-order-books.ts
-│   │   └── dist/
-│   ├── contracts
-│   │   ├── src
-│   │   │   ├── commands.ts
-│   │   │   ├── orders.ts
-│   │   │   └── shared.ts
-│   │   └── dist/
-│   ├── exchange-core
-│   │   ├── src
-│   │   │   ├── book/
-│   │   │   ├── entities/
-│   │   │   ├── matching/
-│   │   │   ├── policies/
-│   │   │   └── primitives.ts
-│   │   └── dist/
-│   ├── infrastructure
-│   │   ├── src
-│   │   │   ├── config/
-│   │   │   ├── identity/
-│   │   │   ├── kafka/
-│   │   │   ├── logging/
-│   │   │   ├── postgres/
-│   │   │   └── time/
-│   │   └── dist/
-│   └── testing
-│       ├── src
-│       │   ├── fixtures/
-│       │   └── kafka/
-│       └── dist/
-├── db
-│   ├── migrations/
-│   ├── scripts/
-│   └── dist/
+├── apps/
+│   ├── broker-api/
+│   └── matching-engine/
+├── packages/
+│   ├── application/
+│   ├── contracts/
+│   ├── exchange-core/
+│   ├── infrastructure/
+│   └── testing/
+├── db/
 ├── docs/
-├── infra
-│   ├── compose/
-│   ├── docker/
-│   └── haproxy/
-├── package.json
-├── pnpm-workspace.yaml
-├── tsconfig.base.json
-├── tsconfig.json
-├── nest-cli.json
-└── eslint.config.mjs
+└── infra/
 ```
 
 At a glance:
 
-- `apps/` contains deployable NestJS services
-- `packages/` contains shared code
-- `db/` contains SQL migrations and database scripts
-- `infra/` contains local runtime assets such as Dockerfiles, Compose, and HAProxy config
-- `docs/` contains the design and implementation notes for the project
+- `apps/` contains the two deployable NestJS services.
+- `packages/` contains shared contracts, domain logic, use cases, adapters, and test helpers.
+- `db/` contains the PostgreSQL schema migration and database scripts.
+- `infra/` contains local runtime assets such as Dockerfiles, Compose, and HAProxy config.
 
 ## Applications
 
@@ -116,19 +41,20 @@ This is the broker-facing HTTP service.
 
 Current source layout:
 
-- `main.ts` boots the Nest application
-- `app.module.ts` wires the app-level module graph
-- `orders/` contains the controller and module for `POST /orders` and `GET /orders/:orderId`
-- `health/` contains the health endpoint
-- `publishing/` contains publishing-related Nest module wiring
-- `runtime/` contains provider definitions, tokens, and shutdown hooks
+- `src/main.ts`: Nest bootstrap
+- `src/app.module.ts`: top-level Nest module
+- `src/orders/`: controller and module for `POST /orders` and `GET /orders/:orderId`
+- `src/health/`: health endpoint
+- `src/runtime/`: provider tokens, runtime factories, and shutdown handling
+- `src/publishing/`: currently just an empty placeholder module
 
-At runtime this app:
+The runtime providers in `src/runtime/runtime.providers.ts` compose:
 
-- validates and forwards order submissions into the application layer
-- reads order status from PostgreSQL-backed repositories
-- publishes commands to Kafka
-- stays stateless between requests
+- config loading from `@decade/infrastructure`
+- JSON logging, clock, request hashing, and ID generation
+- PostgreSQL pool creation
+- Kafka client and publisher creation
+- `SubmitOrder` and `GetOrderStatus` use cases
 
 ### `apps/matching-engine`
 
@@ -136,120 +62,103 @@ This is the worker service that consumes exchange commands and advances order st
 
 Current source layout:
 
-- `main.ts` boots the Nest application
-- `app.module.ts` wires the app-level module graph
-- `engine/` contains the Kafka consumer module and command handler entrypoint
-- `expiration/` contains the expiration scheduler module
-- `health/` contains the health endpoint
-- `runtime/` contains provider definitions, tokens, and shutdown hooks
+- `src/main.ts`: Nest bootstrap
+- `src/app.module.ts`: top-level Nest module
+- `src/engine/`: Kafka consumer wiring and submit-command handling
+- `src/expiration/`: expiration use cases and scheduler
+- `src/health/`: health endpoint
+- `src/runtime/`: provider tokens, runtime module, factories, and shutdown handling
 
-At runtime this app:
+The runtime providers compose:
 
-- consumes `SubmitOrder` and `ExpireOrder` commands from Kafka
-- manages in-memory symbol books through `SymbolOrderBooks`
-- persists order updates, trades, events, and processed-command markers
-- runs expiration scans with a single active lease holder
+- config loading from `@decade/infrastructure`
+- JSON logging, clock, and ID generation
+- PostgreSQL pool creation
+- Kafka client, consumer, and publisher creation
+- the shared in-memory `SymbolOrderBooks` cache
+
+`EngineModule` imports `ExpirationModule`, so a single `matching-engine` process both consumes commands and runs the expiration scan loop.
 
 ## Shared Packages
 
 ### `packages/contracts`
 
-This package defines the shared wire contracts.
+This package defines the wire contracts shared across apps:
 
-Current contents:
+- `src/orders.ts`: HTTP request and response schemas
+- `src/commands.ts`: `SubmitOrder` and `ExpireOrder` schemas
+- `src/shared.ts`: shared Zod primitives
 
-- order request and response schemas in `orders.ts`
-- command schemas in `commands.ts`
-- shared schema helpers in `shared.ts`
-
-This package is the source of truth for:
-
-- `POST /orders` request validation shape
-- accepted and status response payloads
-- `SubmitOrder` and `ExpireOrder` command payloads
+Read this package first if you want the public request and command shapes.
 
 ### `packages/exchange-core`
 
-This package contains the pure exchange domain model.
+This is the pure exchange-domain package. It contains:
 
-Current contents:
-
-- value and branded primitives in `primitives.ts` and `brand.ts`
-- domain enums and constants
-- `OrderBook` and `PriceLevel`
+- branded/domain primitives
+- order side and order status constants
 - order and trade entities
-- matching and execution-price policies
+- the in-memory `OrderBook`
+- matching and execution-price policy code
 - domain validation errors
 
-This is the best package to read first if the goal is to understand:
-
-- price-time priority
-- matching behavior
-- partial fill handling
-- expiration logic inside the live book
+This package holds the core matching behavior and has no dependency on the other workspace packages.
 
 ### `packages/application`
 
-This package contains the orchestration layer and the core runtime-facing abstractions used by the apps today.
+This package is the main orchestration layer, and it currently contains more than just abstract use cases.
 
 Current contents:
 
-- use cases in `src/use-cases/`
-- port interfaces in `src/ports/`
-- command and repository record shapes in `messages.ts` and `records.ts`
-- the in-memory symbol book cache in `symbol-order-books.ts`
-- Kafka command codec, publisher, and consumer classes in `src/kafka/`
-- PostgreSQL repository, mapper, and transaction classes in `src/postgres/`
+- `src/use-cases/`: submit, read, process, and expire order flows
+- `src/ports/`: clock, identity, logger, messaging, repository, and transaction interfaces
+- `src/messages.ts` and `src/records.ts`: shared runtime record types
+- `src/symbol-order-books.ts`: in-memory symbol-to-book cache
+- `src/kafka/`: command codec, publisher, and consumer classes
+- `src/postgres/`: repositories, mappers, advisory lock manager, and transaction manager
 
-In the current codebase, this package is doing more than just pure use-case orchestration. It also contains the classes that the Nest runtime composes directly for:
+The Nest apps instantiate many of these concrete classes directly today. So, in the current codebase, `application` owns both:
 
-- order submission
-- order status reads
-- command processing
-- expiration scans
-- Kafka encode/decode and publish/consume
-- PostgreSQL persistence and transaction handling
-
-That makes `application` the largest shared package in the repo today.
+- use-case orchestration
+- most concrete Kafka and PostgreSQL adapter classes
 
 ### `packages/infrastructure`
 
-This package contains environment-specific helpers and runtime factories.
+This package contains environment-specific helpers and factories. It is smaller than `application`.
 
 Current contents:
 
-- config loading in `config/`
-- ID generation and request hashing in `identity/`
-- Kafka client creation in `kafka/kafka-client.ts`
-- JSON logger wiring in `logging/`
-- PostgreSQL pool creation in `postgres/postgres-pool.ts`
-- wall-clock time in `time/system-clock.ts`
+- `src/config/`: environment parsing and config tests
+- `src/identity/`: request hashing and ID generation
+- `src/logging/`: JSON console logger
+- `src/time/`: system clock
+- `src/kafka/kafka-client.ts`: KafkaJS client factory
+- `src/postgres/postgres-pool.ts`: PostgreSQL pool factory
 
-There are also `kafka/` and `postgres/` files that currently re-export classes from `@decade/application`. Those exist as compatibility wrappers, but the main public surface exported from `src/index.ts` is the runtime helper layer rather than a full adapter implementation package.
+There are also internal files under `src/kafka/` and `src/postgres/` that re-export adapter classes from `@decade/application`. Those wrappers exist, but the apps primarily consume `infrastructure` for factories and environment-bound helpers.
 
 ### `packages/testing`
 
-This package is intentionally small.
+This package contains reusable testing helpers:
 
-Current contents:
+- `src/fixtures/top-sp500-most-active-symbols.ts`: sample symbol basket
+- `src/kafka/`: command-topic sharding helpers, report script, and tests
 
-- symbol fixtures in `fixtures/top-sp500-most-active-symbols.ts`
-- Kafka sharding helpers and tests in `kafka/`
+It is focused on deterministic fixtures and sharding behavior, not a full end-to-end harness.
 
-It is used for reusable test data and deterministic topic-partition calculations rather than broader end-to-end test harnesses.
-
-## Database And Infrastructure Assets
+## Database And Infra Assets
 
 ### `db`
 
 The `db` project contains:
 
-- SQL migrations in `db/migrations/`
-- migration helpers in `db/scripts/migrations.ts`
-- runnable scripts such as `apply-migrations.ts` and `reset-database.ts`
-- migration-focused tests in `db/scripts/migrations.test.ts`
+- `migrations/0001_initial_schema.sql`: the current schema
+- `scripts/apply-migrations.ts`: migration runner
+- `scripts/reset-database.ts`: local reset helper
+- `scripts/migrations.ts`: migration utilities
+- `scripts/migrations.test.ts`: migration tests
 
-The main schema currently creates:
+The main schema creates:
 
 - `orders`
 - `trades`
@@ -261,47 +170,30 @@ The main schema currently creates:
 
 The `infra` directory contains local runtime assets:
 
-- Dockerfiles for both services in `infra/docker/`
-- local Compose configuration in `infra/compose/`
-- HAProxy configuration in `infra/haproxy/`
-
-This is the operational entrypoint for running the stack locally.
+- `infra/docker/`: Dockerfiles for both services
+- `infra/compose/docker-compose.yml`: local stack for PostgreSQL, Kafka, topic initialization, HAProxy, and app containers
+- `infra/haproxy/haproxy.cfg`: HAProxy config for the public API front door
 
 ## Dependency Direction
 
-The current dependency story is:
+The current dependency flow is:
 
-- `contracts` depends on no application-specific packages
-- `exchange-core` is the pure domain package and does not depend on the other workspace packages
-- `application` depends on `contracts` and `exchange-core`
-- `infrastructure` depends on `application`, `contracts`, and `exchange-core`
-- `apps/*` depend on the shared packages and compose the runtime
-- `testing` depends on whatever helpers it needs for test support
+- `contracts` has no dependency on the other workspace packages.
+- `exchange-core` is the pure domain package.
+- `application` depends on `contracts` and `exchange-core`.
+- `infrastructure` depends on `application`, `contracts`, and `exchange-core`.
+- `apps/*` compose runtime behavior from `application` and `infrastructure`.
+- `testing` depends on the packages it needs for fixtures and sharding helpers.
 
-One important nuance in the current codebase: the repository and messaging boundaries are only partially separated. Interface-style ports exist in `packages/application/src/ports`, but the concrete Kafka and PostgreSQL classes currently live in `packages/application/src/kafka` and `packages/application/src/postgres`, with `packages/infrastructure` providing runtime factories around them.
+The important implementation nuance is that package boundaries are only partially strict right now. Concrete Kafka and PostgreSQL adapter classes still live in `packages/application`, while `packages/infrastructure` focuses on factories, env/config, and thin wrappers.
 
-## Testing Layout
+## Suggested Reading Order
 
-Tests are spread across the repo by concern:
+For a quick pass through the codebase:
 
-- `packages/exchange-core` focuses on matching and primitive invariants
-- `packages/contracts` focuses on schema validation
-- `packages/application` focuses on use-case orchestration
-- `packages/infrastructure` focuses on config, identity, Kafka helpers, and PostgreSQL repositories
-- `apps/broker-api` and `apps/matching-engine` contain app-level tests
-- `db` contains migration tests
-
-The current setup is mostly unit and focused integration testing rather than a full end-to-end suite.
-
-## How To Read The Codebase
-
-For a first pass through the repository, this order matches the current implementation well:
-
-1. Read `docs/high-level-system-design.md` for the system model.
-2. Read `packages/contracts` for API and command shapes.
-3. Read `packages/exchange-core` for the matching rules.
-4. Read `packages/application/src/use-cases` and `symbol-order-books.ts` for orchestration.
-5. Read `apps/broker-api` and `apps/matching-engine` for Nest runtime composition.
-6. Read `packages/infrastructure` and `db` for environment wiring and persistence setup.
-
-That path moves from system behavior to runtime composition without assuming cleaner package boundaries than the repository currently has.
+1. Read [`high-level-system-design.md`](./high-level-system-design.md).
+2. Read `packages/contracts/src`.
+3. Read `packages/exchange-core/src`.
+4. Read `packages/application/src/use-cases` and `packages/application/src/symbol-order-books.ts`.
+5. Read `apps/broker-api/src` and `apps/matching-engine/src`.
+6. Read `packages/infrastructure/src`, `db/`, and `infra/`.

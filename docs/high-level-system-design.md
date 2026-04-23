@@ -1,36 +1,94 @@
 # High-Level System Design
 
+Note: `docs/engineering-case-marcelo.md` is deleted in the current working tree, so this document is based on the last committed version of that spec (`git show HEAD:docs/engineering-case-marcelo.md`) plus the current codebase.
+
 ## Overview
 
-This system is a small stock exchange designed to receive orders from brokers, match compatible buy and sell orders, and let brokers query the status of an order later.
+This repository implements a small exchange pipeline with two deployable services:
 
-At a high level, it is built around four pieces:
+- `broker-api` accepts broker order submissions and order-status reads.
+- `matching-engine` consumes exchange commands, owns live order books, and advances order state.
 
-- `broker-api` receives broker requests
-- Kafka carries ordered commands to the matching tier
-- `matching-engine` owns live order books and performs matching
-- PostgreSQL stores durable order, trade, and event data
+The runtime path is:
 
-The design is intentionally simple, but it keeps the exchange guarantees that matter most:
+1. `broker-api` validates a `POST /orders` request.
+2. It persists the accepted order and its idempotency record in PostgreSQL.
+3. It publishes a `SubmitOrder` command to Kafka keyed by `symbol`.
+4. `matching-engine` consumes that command, applies matching, and persists order updates, trades, events, and processed-command markers.
+5. `broker-api` serves `GET /orders/:orderId` directly from PostgreSQL.
 
-- price-time-priority matching
-- one active writer per symbol
-- durable order acceptance
-- horizontal scale across symbols
-- safe recovery after crashes or duplicate delivery
+Order expiration follows the same ordered Kafka path. A scheduler in `matching-engine` scans PostgreSQL for due orders, acquires a PostgreSQL advisory lock so only one scanner is active, and publishes `ExpireOrder` commands keyed by `symbol`.
 
-## What The System Does
+## Main Components
 
-The exchange supports the following core behavior:
+### `broker-api`
 
-- brokers submit buy and sell orders
-- the system assigns an exchange order identifier
-- brokers query order status later using that identifier
-- orders match only when symbol, price, and validity allow it
-- partial fills are supported
-- when bid and ask cross, the trade executes at the seller price
+`broker-api` is the broker-facing HTTP service. It:
 
-The order submission payload includes:
+- exposes `POST /orders`
+- exposes `GET /orders/:orderId`
+- validates request bodies with the shared contract schemas
+- enforces idempotency per `broker_id` and `idempotency_key`
+- persists accepted orders before matching
+- publishes exchange commands to Kafka
+- remains stateless between requests
+
+### Kafka
+
+Kafka is the ordered command bus between acceptance and matching. The current command topic is configurable and defaults to `exchange.commands`.
+
+The important rule is that every command is published with `symbol` as the message key. That gives the system:
+
+- deterministic ordering per symbol
+- partition-based parallelism across symbols
+- a single active consumer owner for each partition within the consumer group
+
+### `matching-engine`
+
+`matching-engine` is the worker service. It:
+
+- consumes `SubmitOrder` and `ExpireOrder`
+- keeps in-memory `OrderBook` instances per symbol
+- restores live books from PostgreSQL on demand
+- writes back order-state changes, trades, and events
+- records processed commands to make Kafka redelivery safe
+- runs the expiration scan loop
+
+### PostgreSQL
+
+PostgreSQL is the durable system of record. The schema stores:
+
+- `orders`
+- `trades`
+- `order_events`
+- `idempotency_keys`
+- `processed_commands`
+
+`orders.resting_sequence` is used to rebuild the FIFO order of live resting orders after a restart.
+
+## Exchange Rules
+
+Each symbol has a bid side and an ask side. The live book keeps:
+
+- an ordered price index per side
+- FIFO order within each price level
+
+The implemented matching rules are:
+
+- only orders with the same symbol can match
+- higher bid prices win on the buy side
+- lower ask prices win on the sell side
+- within the same price level, earlier resting orders win
+- a trade happens when bid price is greater than or equal to ask price
+- execution price is the seller price
+- partial fills are allowed
+- remaining quantity rests in the book only for `open` and `partially_filled` orders
+
+Prices and quantities are stored as integers.
+
+## Acceptance And Idempotency
+
+The API accepts a request payload with:
 
 - `broker_id`
 - `owner_document`
@@ -41,249 +99,66 @@ The order submission payload includes:
 - `valid_until`
 - `idempotency_key`
 
-This design does not cover:
+The submission flow is intentionally split:
 
-- brokerage balances or account management
-- custody or settlement
-- KYC, AML, or compliance workflows
-- advanced market mechanisms such as auctions or market orders
-- multi-region active-active deployment
+1. Parse and validate the request.
+2. Check `idempotency_keys` by `(broker_id, idempotency_key)`.
+3. Inside a PostgreSQL transaction, insert the accepted order plus an idempotency row with `publish_status = 'pending'`.
+4. Publish `SubmitOrder` to Kafka.
+5. Mark the idempotency row as `published`.
+6. Return `202 Accepted` with `order_id`, `status: "accepted"`, and `accepted_at`.
 
-## Core Principles
+If the database write succeeds but Kafka publish fails, the API returns an error. A retry with the same idempotency key resumes from the stored pending record instead of creating a second order.
 
-### One active writer per symbol
+## Runtime State Model
 
-Each symbol is matched by exactly one active engine owner at a time.
+The status progression visible in PostgreSQL is:
 
-That keeps matching deterministic and avoids concurrent writes inside the same order book.
+- `accepted` right after durable API acceptance
+- `open` once the engine places an unmatched order into the live book
+- `partially_filled` after one or more fills with quantity remaining
+- `filled` when remaining quantity reaches zero
+- `expired` when the order expires before it is fully filled
 
-### Matching order comes from the engine path
+Because matching is asynchronous, `GET /orders/:orderId` can briefly return `accepted` after a successful submission.
 
-Broker timestamps are not used to decide fill priority.
+## Ordering, Recovery, And Expiration
 
-The authoritative order is the order in which the engine processes commands for a symbol from Kafka. That is the sequence that defines time priority.
+The system relies on three ordering rules:
 
-### Order acceptance must be durable
+- Kafka preserves command order per symbol key.
+- Only one consumer in the group actively owns a partition at a time.
+- Resting orders are rebuilt from PostgreSQL in `resting_sequence` order.
 
-An order is considered accepted only after:
+Recovery is simple:
 
-- the order is written to PostgreSQL
-- the matching command is accepted by Kafka
+- if a `matching-engine` instance stops, Kafka reassigns its partitions
+- another instance consumes those partitions
+- symbol books are recreated lazily from `open` and `partially_filled` rows
 
-This lets the API acknowledge receipt before matching finishes, without risking silent loss.
+Expiration uses the same ordered path as submissions:
 
-### Hot state in memory, durable state in PostgreSQL
+1. the scheduler acquires a PostgreSQL advisory lock
+2. it loads due orders in `accepted`, `open`, or `partially_filled`
+3. it publishes `ExpireOrder` commands keyed by `symbol`
+4. the owning consumer processes expiration in symbol order
 
-The matching engine keeps active order books in memory for speed.
+That keeps all state transitions on the same command stream.
 
-PostgreSQL remains the system of record for:
+## Failure Handling
 
-- current order state
-- trades
-- immutable order events
-- idempotency records
-- processed command markers
+### Duplicate delivery
 
-### Expiration follows the same ordered path as submission
+Kafka is treated as at-least-once. `matching-engine` records every processed command in `processed_commands` and skips duplicates safely.
 
-Expired orders are not removed by directly mutating live books.
+### API crash before commit
 
-Instead, the system emits expiration commands into the same symbol-keyed command stream used for new orders. That preserves ordering and keeps all live state changes inside the engine.
+If `broker-api` fails before the acceptance transaction commits, the order was not accepted.
 
-## Main Components
+### API crash after commit but before response
 
-### `broker-api`
+The order may already exist with a pending or published idempotency record. A broker retry with the same idempotency key is the recovery path.
 
-This service is the broker-facing entrypoint.
+### Engine crash
 
-Its responsibilities are:
-
-- expose `POST /orders`
-- expose `GET /orders/{order_id}`
-- validate and normalize requests
-- enforce idempotency for retries
-- persist accepted orders in PostgreSQL
-- publish `SubmitOrder` commands to Kafka keyed by `symbol`
-- serve reads directly from PostgreSQL
-
-`broker-api` is stateless between requests, so it can scale horizontally behind a load balancer.
-
-### Kafka command bus
-
-Kafka is the ordered command path between the API and the engine.
-
-Its role is to:
-
-- preserve ordering per symbol
-- decouple broker traffic from matching throughput
-- distribute symbols across partitions
-- define the maximum active parallelism of the engine tier
-
-Every command is keyed by `symbol`, including:
-
-- `SubmitOrder`
-- `ExpireOrder`
-
-One symbol always maps to one Kafka partition, and each partition has only one active consumer owner at a time.
-
-### `matching-engine`
-
-This service performs the actual exchange logic.
-
-Its responsibilities are:
-
-- consume commands from Kafka
-- own in-memory books for the partitions assigned to it
-- apply deterministic price-time-priority matching
-- persist trades, events, and updated order state
-- deduplicate repeated command delivery safely
-- rebuild books after restart
-- run the expiration scheduler
-
-`matching-engine` is horizontally scalable, but only up to the configured Kafka partition count.
-
-### PostgreSQL
-
-PostgreSQL is the durable source of truth.
-
-It stores:
-
-- `orders`
-- `trades`
-- `order_events`
-- `idempotency_keys`
-- `processed_commands`
-
-The engine rebuilds live books from durable open-order state after restart instead of relying on snapshots in the first version.
-
-## Matching Model
-
-Each symbol has two sides:
-
-- a bid book
-- an ask book
-
-Each side is organized as:
-
-- an ordered price index
-- a FIFO queue for each price level
-
-The matching rules are:
-
-- only orders for the same symbol can match
-- best bid has highest priority on the buy side
-- best ask has highest priority on the sell side
-- within the same price level, earlier processed orders win
-- a trade happens when best bid is greater than or equal to best ask
-- execution price is always the seller price
-- partial fills are allowed
-- remaining quantity stays open until filled or expired
-
-All prices and quantities should be stored as integers, never floating-point numbers.
-
-## End-To-End Flows
-
-### Order submission
-
-1. A broker sends `POST /orders` to `broker-api`.
-2. The API validates the request and checks the idempotency key.
-3. The API writes the accepted order and idempotency record to PostgreSQL.
-4. The API publishes `SubmitOrder` to Kafka using `symbol` as the message key.
-5. The API returns `202 Accepted` with the exchange `order_id`.
-
-### Order matching
-
-1. The owning `matching-engine` consumer receives the command.
-2. The engine ignores it if that command was already processed.
-3. The engine loads or initializes the symbol book.
-4. The engine applies price-time-priority matching.
-5. The engine writes trades, events, updated order state, and processed-command markers to PostgreSQL.
-6. Later reads return the latest persisted state.
-
-### Order status query
-
-1. A broker calls `GET /orders/{order_id}`.
-2. `broker-api` reads the current order state from PostgreSQL.
-3. The API returns the persisted status and remaining quantity.
-
-### Order expiration
-
-1. A scheduler inside `matching-engine` scans PostgreSQL for due open orders.
-2. One scheduler instance becomes active using a lease or advisory lock.
-3. It publishes `ExpireOrder` commands to Kafka keyed by `symbol`.
-4. The owning engine consumer processes those commands in symbol order.
-5. The engine verifies the order is still open and truly expired.
-6. The engine persists the expiration event and updated order state.
-
-## Consistency Model
-
-The system separates acceptance from matching.
-
-### When submission succeeds
-
-If `POST /orders` returns success, the following are true:
-
-- the order exists in PostgreSQL
-- Kafka accepted the `SubmitOrder` command
-- the broker has a valid exchange `order_id`
-
-Matching may still happen later.
-
-### What brokers see immediately after submission
-
-Because matching is asynchronous:
-
-- `GET /orders/{order_id}` may briefly show `accepted`
-- reads are eventually consistent relative to matching
-- later states include `open`, `partially_filled`, `filled`, or `expired`
-
-This keeps the write path fast while preserving deterministic matching.
-
-## Failure Handling And Recovery
-
-### API failure before commit
-
-If `broker-api` crashes before the acceptance transaction commits, the order was never accepted.
-
-### API failure after commit
-
-If the API commits but the broker does not receive the response, retry safety depends on idempotency.
-
-### Kafka publish failure during submission
-
-If PostgreSQL write succeeds but Kafka publish fails, the API should return an error and rely on broker retry plus idempotency.
-
-This is the main tradeoff of using a direct database write plus direct Kafka publish instead of an outbox.
-
-### Engine failure
-
-If a `matching-engine` instance crashes:
-
-- Kafka reassigns its partitions
-- another engine instance becomes the owner
-- the new owner rebuilds books from open orders in PostgreSQL
-- command consumption resumes
-
-### Duplicate command delivery
-
-Kafka should be treated as at-least-once delivery.
-
-The engine must make command processing idempotent by recording which commands have already been applied.
-
-## Scaling Model
-
-The two services scale differently.
-
-### API tier
-
-- scales with HTTP traffic
-- remains stateless
-- can autoscale freely
-
-### Matching tier
-
-- scales by Kafka partition ownership
-- can only process as many partitions as exist
-- gains availability from extra replicas beyond active partition count, not more throughput
-
-This is the key system boundary: broker traffic and matching throughput scale independently.
+The in-memory books are disposable. Durable state in PostgreSQL plus Kafka partition reassignment is enough to resume processing.

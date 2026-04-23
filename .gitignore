@@ -5,3 +5,7 @@ coverage
 .pnpm-store
 *.tsbuildinfo
 
+scratch
+
+.claude/
+
