@@ -2,8 +2,8 @@ import { Inject, Injectable } from "@nestjs/common";
 import type { OnApplicationBootstrap, OnApplicationShutdown } from "@nestjs/common";
 
 import type {
-  CommandConsumer,
   ConsumedCommand,
+  KafkaCommandConsumer,
   Logger,
   ProcessExpireCommand,
   ProcessExpireCommandResult,
@@ -25,7 +25,7 @@ export class ExchangeCommandsConsumer
   implements OnApplicationBootstrap, OnApplicationShutdown
 {
   constructor(
-    @Inject(COMMAND_CONSUMER) private readonly commandConsumer: CommandConsumer,
+    @Inject(COMMAND_CONSUMER) private readonly commandConsumer: KafkaCommandConsumer,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
     @Inject(PROCESS_ORDER_COMMAND_USE_CASE)
     private readonly processOrderCommand: ProcessOrderCommand,

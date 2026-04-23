@@ -10,6 +10,7 @@ import {
 } from "./shared";
 
 export const submitOrderRequestSchema = z.object({
+  broker_id: nonEmptyStringSchema,
   owner_document: nonEmptyStringSchema,
   side: orderSideSchema,
   symbol: symbolSchema,

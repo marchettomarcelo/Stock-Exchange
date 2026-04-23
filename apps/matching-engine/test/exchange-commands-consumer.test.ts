@@ -1,11 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
-import type { CommandConsumer, ConsumedCommand, Logger } from "@decade/application";
+import type { ConsumedCommand, KafkaCommandConsumer, Logger } from "@decade/application";
 
 import { ExchangeCommandsConsumer } from "../src/engine/exchange-commands-consumer";
 import { MatchingEngineRuntime } from "../src/runtime/runtime.shutdown";
 
-class FakeCommandConsumer implements CommandConsumer {
+class FakeCommandConsumer {
   subscription:
     | {
         topic: string;
@@ -54,7 +54,7 @@ describe("ExchangeCommandsConsumer", () => {
       execute: vi.fn()
     };
     const service = new ExchangeCommandsConsumer(
-      commandConsumer,
+      commandConsumer as unknown as KafkaCommandConsumer,
       {
         serviceName: "matching-engine",
         logLevel: "info",
@@ -135,7 +135,7 @@ describe("ExchangeCommandsConsumer", () => {
       })
     };
     const service = new ExchangeCommandsConsumer(
-      commandConsumer,
+      commandConsumer as unknown as KafkaCommandConsumer,
       {
         serviceName: "matching-engine",
         logLevel: "info",

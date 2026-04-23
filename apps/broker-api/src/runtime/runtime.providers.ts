@@ -1,31 +1,30 @@
 import type { Provider } from "@nestjs/common";
 
-import { GetOrderStatus, SubmitOrder } from "@decade/application";
 import type {
   Clock,
-  CommandPublisher,
   IdGenerator,
-  IdempotencyRepository,
-  Logger,
-  OrderRepository,
-  RequestHasher,
-  TransactionManager
+  PostgresPool,
+  RequestHasher
 } from "@decade/application";
 import {
-  JsonConsoleLogger,
-  JsonRequestHasher,
-  type AppConfig,
-  type DisconnectablePublisher,
+  GetOrderStatus,
   PostgresIdempotencyRepository,
   PostgresOrderRepository,
   PostgresTransactionManager,
+  SubmitOrder
+} from "@decade/application";
+import type { Logger } from "@decade/application";
+import {
+  type DisconnectablePublisher,
+  JsonConsoleLogger,
+  JsonRequestHasher,
+  type AppConfig,
   SystemClock,
   SystemIdGenerator,
   createKafkaClient,
   createKafkaPublisher,
   createPostgresPool,
-  loadAppConfig,
-  type PostgresPool
+  loadAppConfig
 } from "@decade/infrastructure";
 
 import {
@@ -33,15 +32,12 @@ import {
   CLOCK,
   COMMAND_PUBLISHER,
   GET_ORDER_STATUS_USE_CASE,
-  IDEMPOTENCY_REPOSITORY,
   ID_GENERATOR,
   KAFKA_CLIENT,
   LOGGER,
-  ORDER_REPOSITORY,
   POSTGRES_POOL,
   REQUEST_HASHER,
-  SUBMIT_ORDER_USE_CASE,
-  TRANSACTION_MANAGER
+  SUBMIT_ORDER_USE_CASE
 } from "./runtime.tokens";
 import { BrokerApiRuntime } from "./runtime.shutdown";
 
@@ -83,22 +79,6 @@ export const runtimeProviders: Provider[] = [
     useFactory: (config: AppConfig): PostgresPool => createPostgresPool(config.database)
   },
   {
-    provide: ORDER_REPOSITORY,
-    inject: [POSTGRES_POOL],
-    useFactory: (pool: PostgresPool): OrderRepository => new PostgresOrderRepository(pool)
-  },
-  {
-    provide: IDEMPOTENCY_REPOSITORY,
-    inject: [POSTGRES_POOL],
-    useFactory: (pool: PostgresPool): IdempotencyRepository =>
-      new PostgresIdempotencyRepository(pool)
-  },
-  {
-    provide: TRANSACTION_MANAGER,
-    inject: [POSTGRES_POOL],
-    useFactory: (pool: PostgresPool): TransactionManager => new PostgresTransactionManager(pool)
-  },
-  {
     provide: KAFKA_CLIENT,
     inject: [APP_CONFIG],
     useFactory: (config: AppConfig) => createKafkaClient(config.kafka)
@@ -113,9 +93,7 @@ export const runtimeProviders: Provider[] = [
   {
     provide: SUBMIT_ORDER_USE_CASE,
     inject: [
-      ORDER_REPOSITORY,
-      IDEMPOTENCY_REPOSITORY,
-      TRANSACTION_MANAGER,
+      POSTGRES_POOL,
       COMMAND_PUBLISHER,
       ID_GENERATOR,
       REQUEST_HASHER,
@@ -124,10 +102,8 @@ export const runtimeProviders: Provider[] = [
       LOGGER
     ],
     useFactory: (
-      orderRepository: OrderRepository,
-      idempotencyRepository: IdempotencyRepository,
-      transactionManager: TransactionManager,
-      commandPublisher: CommandPublisher,
+      pool: PostgresPool,
+      commandPublisher: DisconnectablePublisher,
       idGenerator: IdGenerator,
       requestHasher: RequestHasher,
       clock: Clock,
@@ -135,11 +111,10 @@ export const runtimeProviders: Provider[] = [
       logger: Logger
     ): SubmitOrder =>
       new SubmitOrder({
-        brokerId: process.env.BROKER_ID ?? "broker-api",
-        orderRepository,
-        idempotencyRepository,
-        transactionManager,
-        commandPublisher,
+        orders: new PostgresOrderRepository(pool),
+        idempotency: new PostgresIdempotencyRepository(pool),
+        transactions: new PostgresTransactionManager(pool),
+        commands: commandPublisher,
         idGenerator,
         requestHasher,
         clock,
@@ -149,10 +124,10 @@ export const runtimeProviders: Provider[] = [
   },
   {
     provide: GET_ORDER_STATUS_USE_CASE,
-    inject: [ORDER_REPOSITORY, LOGGER],
-    useFactory: (orderRepository: OrderRepository, logger: Logger): GetOrderStatus =>
+    inject: [POSTGRES_POOL, LOGGER],
+    useFactory: (pool: PostgresPool, logger: Logger): GetOrderStatus =>
       new GetOrderStatus({
-        orderRepository,
+        orders: new PostgresOrderRepository(pool),
         logger
       })
   },

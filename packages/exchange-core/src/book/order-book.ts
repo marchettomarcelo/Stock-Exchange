@@ -75,8 +75,6 @@ export class OrderBook {
   constructor(public readonly symbol: Symbol) {}
 
   placeOrder(input: OrderInput, processedAt: IsoTimestamp): PlaceOrderResult {
-    this.ensureOrderBelongsToBook(input.symbol);
-
     if (this.liveOrders.has(input.orderId)) {
       throw new DomainValidationError(`order_id ${input.orderId} already exists in the book`);
     }
@@ -141,8 +139,6 @@ export class OrderBook {
   }
 
   restoreOrder(input: RestoredOrderInput): OrderSnapshot {
-    this.ensureOrderBelongsToBook(input.symbol);
-
     if (this.liveOrders.has(input.orderId)) {
       throw new DomainValidationError(`order_id ${input.orderId} already exists in the book`);
     }
@@ -278,13 +274,5 @@ export class OrderBook {
 
     this.liveOrders.delete(orderId);
     this.orderLocations.delete(orderId);
-  }
-
-  private ensureOrderBelongsToBook(symbol: Symbol): void {
-    if (symbol !== this.symbol) {
-      throw new DomainValidationError(
-        `order symbol ${symbol} does not belong to book ${this.symbol}`
-      );
-    }
   }
 }

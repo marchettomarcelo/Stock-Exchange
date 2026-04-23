@@ -19,3 +19,9 @@ export class InvariantError extends ApplicationError {
   }
 }
 
+export class ConflictError extends ApplicationError {
+  constructor(message: string) {
+    super(message);
+    this.name = "ConflictError";
+  }
+}

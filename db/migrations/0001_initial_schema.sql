@@ -56,9 +56,21 @@ CREATE TABLE idempotency_keys (
   broker_id TEXT NOT NULL,
   idempotency_key TEXT NOT NULL,
   order_id TEXT NOT NULL REFERENCES orders(order_id),
+  command_id TEXT NOT NULL UNIQUE,
+  symbol TEXT NOT NULL,
   request_hash TEXT NOT NULL,
+  publish_status TEXT NOT NULL CHECK (publish_status IN ('pending', 'published')),
   created_at TIMESTAMPTZ NOT NULL,
+  published_at TIMESTAMPTZ,
   PRIMARY KEY (broker_id, idempotency_key)
+  ,
+  CHECK (char_length(symbol) BETWEEN 1 AND 16),
+  CHECK (substring(symbol FROM 1 FOR 1) BETWEEN 'A' AND 'Z'),
+  CHECK (translate(symbol, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-', '') = ''),
+  CHECK (
+    (publish_status = 'pending' AND published_at IS NULL)
+    OR (publish_status = 'published' AND published_at IS NOT NULL)
+  )
 );
 
 CREATE TABLE processed_commands (

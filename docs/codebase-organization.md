@@ -2,75 +2,111 @@
 
 ## Overview
 
-This project is easiest to build and maintain as a small monorepo with two deployable applications and a small set of shared packages.
-
-The goal of this structure is straightforward:
-
-- keep deployable services easy to find
-- keep matching logic isolated from transport and storage code
-- make shared contracts explicit
-- let the API tier and engine tier evolve independently without duplicating core logic
-
-The main applications are:
+This repository is a TypeScript monorepo for a small exchange system with two deployable applications:
 
 - `broker-api`
 - `matching-engine`
 
-The shared packages support those two applications without turning the repository into a large framework.
+The codebase is organized around a few shared packages:
+
+- `contracts` defines request, response, and command schemas
+- `exchange-core` contains the matching engine domain logic
+- `application` contains use cases, records, ports, and the current Kafka/PostgreSQL-facing classes used by the apps
+- `infrastructure` contains runtime factories and environment-specific helpers
+- `testing` contains reusable fixtures and Kafka sharding helpers
+
+The repository currently also checks in generated `dist/` output and `tsconfig.tsbuildinfo` files for apps, packages, and the `db` project.
 
 ## Repository Shape
 
-The intended layout is:
+This is the current high-level layout:
 
 ```text
 .
 ├── apps
 │   ├── broker-api
 │   │   ├── src
-│   │   │   ├── main.ts
 │   │   │   ├── app.module.ts
-│   │   │   ├── orders
-│   │   │   ├── publishing
-│   │   │   └── health
-│   │   └── test
+│   │   │   ├── main.ts
+│   │   │   ├── health/
+│   │   │   ├── orders/
+│   │   │   ├── publishing/
+│   │   │   └── runtime/
+│   │   ├── test/
+│   │   └── dist/
 │   └── matching-engine
 │       ├── src
-│       │   ├── main.ts
 │       │   ├── app.module.ts
-│       │   ├── engine
-│       │   ├── expiration
-│       │   └── health
-│       └── test
+│       │   ├── main.ts
+│       │   ├── engine/
+│       │   ├── expiration/
+│       │   ├── health/
+│       │   └── runtime/
+│       ├── test/
+│       └── dist/
 ├── packages
-│   ├── exchange-core
 │   ├── application
-│   ├── infrastructure
+│   │   ├── src
+│   │   │   ├── kafka/
+│   │   │   ├── ports/
+│   │   │   ├── postgres/
+│   │   │   ├── use-cases/
+│   │   │   ├── messages.ts
+│   │   │   ├── records.ts
+│   │   │   └── symbol-order-books.ts
+│   │   └── dist/
 │   ├── contracts
+│   │   ├── src
+│   │   │   ├── commands.ts
+│   │   │   ├── orders.ts
+│   │   │   └── shared.ts
+│   │   └── dist/
+│   ├── exchange-core
+│   │   ├── src
+│   │   │   ├── book/
+│   │   │   ├── entities/
+│   │   │   ├── matching/
+│   │   │   ├── policies/
+│   │   │   └── primitives.ts
+│   │   └── dist/
+│   ├── infrastructure
+│   │   ├── src
+│   │   │   ├── config/
+│   │   │   ├── identity/
+│   │   │   ├── kafka/
+│   │   │   ├── logging/
+│   │   │   ├── postgres/
+│   │   │   └── time/
+│   │   └── dist/
 │   └── testing
+│       ├── src
+│       │   ├── fixtures/
+│       │   └── kafka/
+│       └── dist/
 ├── db
-│   ├── migrations
-│   └── seeds
+│   ├── migrations/
+│   ├── scripts/
+│   └── dist/
+├── docs/
 ├── infra
-│   ├── docker
-│   │   ├── Dockerfile.broker-api
-│   │   └── Dockerfile.matching-engine
-│   └── compose
-│       └── docker-compose.yml
-├── docs
+│   ├── compose/
+│   ├── docker/
+│   └── haproxy/
 ├── package.json
 ├── pnpm-workspace.yaml
-├── nest-cli.json
 ├── tsconfig.base.json
+├── tsconfig.json
+├── nest-cli.json
 └── eslint.config.mjs
 ```
 
 At a glance:
 
-- `apps/` contains deployable entrypoints
-- `packages/` contains shared code with clear boundaries
-- `db/` contains schema migrations and seeds
-- `infra/` contains local and container runtime setup
-- `docs/` contains design and onboarding material
+- `apps/` contains deployable NestJS services
+- `packages/` contains shared code
+- `db/` contains SQL migrations and database scripts
+- `infra/` contains local runtime assets such as Dockerfiles, Compose, and HAProxy config
+- `docs/` contains the design and implementation notes for the project
 
 ## Applications
 
@@ -78,143 +114,142 @@ At a glance:
 
 This is the broker-facing HTTP service.
 
-It should own:
+Current source layout:
 
-- request validation
-- idempotent order submission
-- PostgreSQL writes for accepted orders
-- Kafka publish for `SubmitOrder`
-- direct reads for `GET /orders/{order_id}`
-- health and readiness endpoints
+- `main.ts` boots the Nest application
+- `app.module.ts` wires the app-level module graph
+- `orders/` contains the controller and module for `POST /orders` and `GET /orders/:orderId`
+- `health/` contains the health endpoint
+- `publishing/` contains publishing-related Nest module wiring
+- `runtime/` contains provider definitions, tokens, and shutdown hooks
 
-This app should stay stateless between requests.
+At runtime this app:
+
+- validates and forwards order submissions into the application layer
+- reads order status from PostgreSQL-backed repositories
+- publishes commands to Kafka
+- stays stateless between requests
 
 ### `apps/matching-engine`
 
-This is the internal worker that owns live matching.
+This is the worker service that consumes exchange commands and advances order state.
 
-It should own:
+Current source layout:
 
-- Kafka command consumption
-- partition ownership
-- in-memory order books
-- deterministic matching
-- trade and order-state persistence
-- processed-command deduplication
-- the expiration scheduler
-- health and readiness endpoints
+- `main.ts` boots the Nest application
+- `app.module.ts` wires the app-level module graph
+- `engine/` contains the Kafka consumer module and command handler entrypoint
+- `expiration/` contains the expiration scheduler module
+- `health/` contains the health endpoint
+- `runtime/` contains provider definitions, tokens, and shutdown hooks
 
-This app is stateful at runtime because it owns live books in memory, but that state is rebuilt from durable data after restart.
+At runtime this app:
+
+- consumes `SubmitOrder` and `ExpireOrder` commands from Kafka
+- manages in-memory symbol books through `SymbolOrderBooks`
+- persists order updates, trades, events, and processed-command markers
+- runs expiration scans with a single active lease holder
 
 ## Shared Packages
 
+### `packages/contracts`
+
+This package defines the shared wire contracts.
+
+Current contents:
+
+- order request and response schemas in `orders.ts`
+- command schemas in `commands.ts`
+- shared schema helpers in `shared.ts`
+
+This package is the source of truth for:
+
+- `POST /orders` request validation shape
+- accepted and status response payloads
+- `SubmitOrder` and `ExpireOrder` command payloads
+
 ### `packages/exchange-core`
 
-This package contains the pure exchange engine.
+This package contains the pure exchange domain model.
 
-It should include:
+Current contents:
 
-- `OrderBook`
-- bid-side and ask-side structures
-- matching policies
-- execution generation
-- expiration checks
-- value objects
-- domain errors
+- value and branded primitives in `primitives.ts` and `brand.ts`
+- domain enums and constants
+- `OrderBook` and `PriceLevel`
+- order and trade entities
+- matching and execution-price policies
+- domain validation errors
 
-Rules for this package:
+This is the best package to read first if the goal is to understand:
 
-- no NestJS dependencies
-- no SQL or repository code
-- no Kafka client code
-- no HTTP concerns
-- use integers for price and quantity
-
-If someone wants to understand the matching algorithm, this is the first package they should read.
+- price-time priority
+- matching behavior
+- partial fill handling
+- expiration logic inside the live book
 
 ### `packages/application`
 
-This package contains use cases and orchestration that sit between the pure domain and the adapters.
+This package contains the orchestration layer and the core runtime-facing abstractions used by the apps today.
 
-It should include:
+Current contents:
 
-- `SubmitOrder`
-- `GetOrderStatus`
-- `ProcessOrderCommand`
-- `ProcessExpireCommand`
-- expiration scan orchestration
-- idempotency rules
-- processed-command deduplication rules
+- use cases in `src/use-cases/`
+- port interfaces in `src/ports/`
+- command and repository record shapes in `messages.ts` and `records.ts`
+- the in-memory symbol book cache in `symbol-order-books.ts`
+- Kafka command codec, publisher, and consumer classes in `src/kafka/`
+- PostgreSQL repository, mapper, and transaction classes in `src/postgres/`
 
-This package should depend on interfaces rather than concrete drivers.
+In the current codebase, this package is doing more than just pure use-case orchestration. It also contains the classes that the Nest runtime composes directly for:
+
+- order submission
+- order status reads
+- command processing
+- expiration scans
+- Kafka encode/decode and publish/consume
+- PostgreSQL persistence and transaction handling
+
+That makes `application` the largest shared package in the repo today.
 
 ### `packages/infrastructure`
 
-This package contains adapters for external systems.
+This package contains environment-specific helpers and runtime factories.
 
-It should include:
+Current contents:
 
-- PostgreSQL repositories
-- transaction helpers
-- Kafka producer and consumer adapters
-- lease or advisory-lock helpers
-- configuration loading
-- logger wiring
-- metrics wiring
+- config loading in `config/`
+- ID generation and request hashing in `identity/`
+- Kafka client creation in `kafka/kafka-client.ts`
+- JSON logger wiring in `logging/`
+- PostgreSQL pool creation in `postgres/postgres-pool.ts`
+- wall-clock time in `time/system-clock.ts`
 
-This is the package that knows how the system talks to PostgreSQL and Kafka.
-
-### `packages/contracts`
-
-This package defines the messages and schemas shared across boundaries.
-
-It should include:
-
-- HTTP request and response schemas
-- `SubmitOrder` command payloads
-- `ExpireOrder` command payloads
-- query DTOs
-- shared enums and status shapes
-
-This package should stay small and stable because it defines the system's external and internal contracts.
+There are also `kafka/` and `postgres/` files that currently re-export classes from `@decade/application`. Those exist as compatibility wrappers, but the main public surface exported from `src/index.ts` is the runtime helper layer rather than a full adapter implementation package.
 
 ### `packages/testing`
 
-This package centralizes reusable test support.
+This package is intentionally small.
 
-It should include:
+Current contents:
 
-- order fixture builders
-- fake clock utilities
-- PostgreSQL integration helpers
-- Kafka integration helpers
-- deterministic engine assertions
+- symbol fixtures in `fixtures/top-sp500-most-active-symbols.ts`
+- Kafka sharding helpers and tests in `kafka/`
 
-This keeps tests consistent without spreading custom helpers across every app.
+It is used for reusable test data and deterministic topic-partition calculations rather than broader end-to-end test harnesses.
 
-## Dependency Direction
+## Database And Infrastructure Assets
 
-The most important dependency rule is simple:
+### `db`
 
-- the matching core must not know about HTTP, Kafka client APIs, or PostgreSQL
+The `db` project contains:
 
-The rest of the dependency direction should follow these rules:
+- SQL migrations in `db/migrations/`
+- migration helpers in `db/scripts/migrations.ts`
+- runnable scripts such as `apply-migrations.ts` and `reset-database.ts`
+- migration-focused tests in `db/scripts/migrations.test.ts`
 
-- `apps/*` may depend on `packages/*`
-- `exchange-core` must not depend on the other packages
-- `application` may depend on `exchange-core` and `contracts`
-- `application` should talk to storage and messaging through interfaces
-- `infrastructure` may depend on `application` and `contracts`
-- `contracts` should not depend on framework-specific infrastructure
-- `testing` may depend on any package needed for test support
-
-These boundaries make it possible to test matching behavior in isolation and replace adapters without rewriting domain logic.
-
-## Persistence Layout
-
-The database exists to support durable order acceptance, matching recovery, and broker-facing reads.
-
-The main tables are:
+The main schema currently creates:
 
 - `orders`
 - `trades`
@@ -222,104 +257,51 @@ The main tables are:
 - `idempotency_keys`
 - `processed_commands`
 
-Their responsibilities are:
+### `infra`
 
-- `orders` stores the current state of each order
-- `trades` stores every execution
-- `order_events` stores the order lifecycle trail
-- `idempotency_keys` protects broker retries
-- `processed_commands` prevents duplicate engine side effects
+The `infra` directory contains local runtime assets:
 
-Direct reads for `GET /orders/{order_id}` should come from PostgreSQL rather than from live engine memory.
+- Dockerfiles for both services in `infra/docker/`
+- local Compose configuration in `infra/compose/`
+- HAProxy configuration in `infra/haproxy/`
 
-## Messaging Layout
+This is the operational entrypoint for running the stack locally.
 
-Kafka is used narrowly as the ordered command bus between the API and matching engine.
+## Dependency Direction
 
-The main rules are:
+The current dependency story is:
 
-- publish `SubmitOrder` and `ExpireOrder`
-- always key messages by `symbol`
-- assume at-least-once delivery
-- make engine handlers idempotent
-- keep payloads minimal and stable
-- use a fixed partition count to define engine parallelism
+- `contracts` depends on no application-specific packages
+- `exchange-core` is the pure domain package and does not depend on the other workspace packages
+- `application` depends on `contracts` and `exchange-core`
+- `infrastructure` depends on `application`, `contracts`, and `exchange-core`
+- `apps/*` depend on the shared packages and compose the runtime
+- `testing` depends on whatever helpers it needs for test support
 
-That partition count is an architectural setting, not just a Kafka detail. It decides how much matching work can run in parallel.
+One important nuance in the current codebase: the repository and messaging boundaries are only partially separated. Interface-style ports exist in `packages/application/src/ports`, but the concrete Kafka and PostgreSQL classes currently live in `packages/application/src/kafka` and `packages/application/src/postgres`, with `packages/infrastructure` providing runtime factories around them.
 
-## Runtime Model
+## Testing Layout
 
-### `broker-api` runtime
+Tests are spread across the repo by concern:
 
-- runs as a stateless deployment
-- scales with HTTP traffic
-- reads from PostgreSQL directly
-- publishes commands to Kafka directly
+- `packages/exchange-core` focuses on matching and primitive invariants
+- `packages/contracts` focuses on schema validation
+- `packages/application` focuses on use-case orchestration
+- `packages/infrastructure` focuses on config, identity, Kafka helpers, and PostgreSQL repositories
+- `apps/broker-api` and `apps/matching-engine` contain app-level tests
+- `db` contains migration tests
 
-### `matching-engine` runtime
-
-- runs as a worker deployment
-- consumes Kafka partitions in a consumer group
-- owns symbol books for its assigned partitions
-- scales only up to the Kafka partition count
-- runs exactly one active expiration scheduler using a lease or advisory lock
-
-This split keeps the operational model easy to reason about: the API handles ingress and reads, while the engine handles ordered state transitions.
-
-## Testing Strategy
-
-The repository should support four levels of testing.
-
-### Unit tests
-
-Focus on `exchange-core`:
-
-- price-time priority
-- seller-price execution
-- partial fills
-- expiration checks
-
-### Application tests
-
-Focus on orchestration:
-
-- idempotent submission
-- duplicate command handling
-- order-state transitions
-
-### Integration tests
-
-Focus on adapters:
-
-- PostgreSQL persistence
-- Kafka publish and consume behavior
-- engine recovery from durable open orders
-
-### End-to-end tests
-
-Focus on the broker-facing behavior:
-
-- `POST /orders`
-- `GET /orders/{order_id}`
-- asynchronous transition from accepted to matched or expired
-
-Recommended tooling:
-
-- Vitest
-- Nest testing utilities
-- Supertest
-- Testcontainers
-- `fast-check` for matching invariants
+The current setup is mostly unit and focused integration testing rather than a full end-to-end suite.
 
 ## How To Read The Codebase
 
-For a first pass through the repository, this order works well:
+For a first pass through the repository, this order matches the current implementation well:
 
-1. Read `docs/high-level-system-design.md` to understand the runtime model.
-2. Read `packages/contracts` to see the system inputs and outputs.
-3. Read `packages/exchange-core` to understand matching behavior.
-4. Read `packages/application` to see how commands and use cases are orchestrated.
-5. Read `apps/broker-api` and `apps/matching-engine` to see how the system is composed at runtime.
-6. Read `packages/infrastructure` last to understand PostgreSQL, Kafka, and operational wiring.
+1. Read `docs/high-level-system-design.md` for the system model.
+2. Read `packages/contracts` for API and command shapes.
+3. Read `packages/exchange-core` for the matching rules.
+4. Read `packages/application/src/use-cases` and `symbol-order-books.ts` for orchestration.
+5. Read `apps/broker-api` and `apps/matching-engine` for Nest runtime composition.
+6. Read `packages/infrastructure` and `db` for environment wiring and persistence setup.
 
-That path moves from system behavior to implementation details without mixing concerns too early.
+That path moves from system behavior to runtime composition without assuming cleaner package boundaries than the repository currently has.

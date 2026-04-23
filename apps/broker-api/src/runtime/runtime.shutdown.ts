@@ -1,7 +1,8 @@
 import { Inject, Injectable } from "@nestjs/common";
 import type { OnApplicationShutdown } from "@nestjs/common";
 
-import type { DisconnectablePublisher, PostgresPool } from "@decade/infrastructure";
+import type { PostgresPool } from "@decade/application";
+import type { DisconnectablePublisher } from "@decade/infrastructure";
 
 import { COMMAND_PUBLISHER, POSTGRES_POOL } from "./runtime.tokens";
 

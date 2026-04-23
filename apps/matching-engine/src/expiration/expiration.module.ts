@@ -2,22 +2,22 @@ import { Module } from "@nestjs/common";
 
 import type {
   Clock,
-  CommandPublisher,
   IdGenerator,
-  LeaseManager,
-  Logger,
-  OrderEventRepository,
-  OrderRepository,
-  ProcessedCommandRepository,
+  PostgresPool,
   ScanForExpiredOrders,
-  SymbolOrderBooks,
-  TransactionManager
+  SymbolOrderBooks
 } from "@decade/application";
 import {
+  PostgresAdvisoryLockManager,
+  PostgresOrderEventRepository,
+  PostgresOrderRepository,
+  PostgresProcessedCommandRepository,
+  PostgresTransactionManager,
   ProcessExpireCommand,
   ScanForExpiredOrders as ScanForExpiredOrdersUseCase
 } from "@decade/application";
-import type { AppConfig } from "@decade/infrastructure";
+import type { Logger } from "@decade/application";
+import type { AppConfig, DisconnectablePublisher } from "@decade/infrastructure";
 
 import { RuntimeModule } from "../runtime/runtime.module";
 import {
@@ -25,15 +25,11 @@ import {
   CLOCK,
   COMMAND_PUBLISHER,
   ID_GENERATOR,
-  LEASE_MANAGER,
   LOGGER,
-  ORDER_EVENT_REPOSITORY,
-  ORDER_REPOSITORY,
+  POSTGRES_POOL,
   PROCESS_EXPIRE_COMMAND_USE_CASE,
-  PROCESSED_COMMAND_REPOSITORY,
   SCAN_EXPIRED_ORDERS_USE_CASE,
-  SYMBOL_ORDER_BOOKS,
-  TRANSACTION_MANAGER
+  SYMBOL_ORDER_BOOKS
 } from "../runtime/runtime.tokens";
 import { ExpirationScheduler } from "./expiration-scheduler";
 
@@ -42,29 +38,18 @@ import { ExpirationScheduler } from "./expiration-scheduler";
   providers: [
     {
       provide: PROCESS_EXPIRE_COMMAND_USE_CASE,
-      inject: [
-        PROCESSED_COMMAND_REPOSITORY,
-        ORDER_REPOSITORY,
-        ORDER_EVENT_REPOSITORY,
-        TRANSACTION_MANAGER,
-        CLOCK,
-        SYMBOL_ORDER_BOOKS,
-        LOGGER
-      ],
+      inject: [POSTGRES_POOL, CLOCK, SYMBOL_ORDER_BOOKS, LOGGER],
       useFactory: (
-        processedCommandRepository: ProcessedCommandRepository,
-        orderRepository: OrderRepository,
-        orderEventRepository: OrderEventRepository,
-        transactionManager: TransactionManager,
+        pool: PostgresPool,
         clock: Clock,
         symbolBooks: SymbolOrderBooks,
         logger: Logger
       ): ProcessExpireCommand =>
         new ProcessExpireCommand({
-          processedCommandRepository,
-          orderRepository,
-          orderEventRepository,
-          transactionManager,
+          processedCommands: new PostgresProcessedCommandRepository(pool),
+          orders: new PostgresOrderRepository(pool),
+          orderEvents: new PostgresOrderEventRepository(pool),
+          transactions: new PostgresTransactionManager(pool),
           clock,
           symbolBooks,
           logger
@@ -72,28 +57,19 @@ import { ExpirationScheduler } from "./expiration-scheduler";
     },
     {
       provide: SCAN_EXPIRED_ORDERS_USE_CASE,
-      inject: [
-        LEASE_MANAGER,
-        ORDER_REPOSITORY,
-        COMMAND_PUBLISHER,
-        ID_GENERATOR,
-        CLOCK,
-        APP_CONFIG,
-        LOGGER
-      ],
+      inject: [POSTGRES_POOL, COMMAND_PUBLISHER, ID_GENERATOR, CLOCK, APP_CONFIG, LOGGER],
       useFactory: (
-        leaseManager: LeaseManager,
-        orderRepository: OrderRepository,
-        commandPublisher: CommandPublisher,
+        pool: PostgresPool,
+        commandPublisher: DisconnectablePublisher,
         idGenerator: IdGenerator,
         clock: Clock,
         config: AppConfig,
         logger: Logger
       ): ScanForExpiredOrders =>
         new ScanForExpiredOrdersUseCase({
-          leaseManager,
-          orderRepository,
-          commandPublisher,
+          leaseManager: new PostgresAdvisoryLockManager(pool),
+          orders: new PostgresOrderRepository(pool),
+          commands: commandPublisher,
           idGenerator,
           clock,
           commandsTopic: config.kafka.commandsTopic,

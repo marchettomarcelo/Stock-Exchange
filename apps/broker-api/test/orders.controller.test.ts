@@ -1,11 +1,12 @@
 import {
   BadRequestException,
+  ConflictException,
   InternalServerErrorException,
   NotFoundException
 } from "@nestjs/common";
 import { describe, expect, it, vi } from "vitest";
 
-import { ApplicationError, NotFoundError } from "@decade/application";
+import { ApplicationError, ConflictError, NotFoundError } from "@decade/application";
 
 import { OrdersController } from "../src/orders/orders.controller";
 
@@ -26,6 +27,7 @@ describe("OrdersController", () => {
     );
 
     const response = await controller.submit({
+      broker_id: "broker-1",
       owner_document: "12345678900",
       side: "bid",
       symbol: "AAPL",
@@ -36,6 +38,7 @@ describe("OrdersController", () => {
     });
 
     expect(submitOrder.execute).toHaveBeenCalledWith({
+      broker_id: "broker-1",
       owner_document: "12345678900",
       side: "bid",
       symbol: "AAPL",
@@ -54,7 +57,12 @@ describe("OrdersController", () => {
   it("rejects invalid order bodies with a 400 error", async () => {
     const controller = new OrdersController(
       {
-        execute: vi.fn()
+        execute: vi.fn().mockRejectedValue(
+          Object.assign(new Error("invalid"), {
+            name: "ZodError",
+            issues: [{ path: ["symbol"], message: "invalid symbol" }]
+          })
+        )
       } as never,
       {
         execute: vi.fn()
@@ -63,6 +71,7 @@ describe("OrdersController", () => {
 
     await expect(
       controller.submit({
+        broker_id: "broker-1",
         owner_document: "12345678900",
         side: "bid",
         symbol: "aapl",
@@ -72,6 +81,30 @@ describe("OrdersController", () => {
         idempotency_key: "idem-1"
       })
     ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it("maps idempotency conflicts to a 409 error", async () => {
+    const controller = new OrdersController(
+      {
+        execute: vi.fn().mockRejectedValue(new ConflictError("duplicate key reuse"))
+      } as never,
+      {
+        execute: vi.fn()
+      } as never
+    );
+
+    await expect(
+      controller.submit({
+        broker_id: "broker-1",
+        owner_document: "12345678900",
+        side: "bid",
+        symbol: "AAPL",
+        price: 100,
+        quantity: 10,
+        valid_until: "2026-01-01T15:00:00Z",
+        idempotency_key: "idem-1"
+      })
+    ).rejects.toBeInstanceOf(ConflictException);
   });
 
   it("maps missing orders to a 404 error", async () => {
@@ -99,6 +132,7 @@ describe("OrdersController", () => {
 
     await expect(
       controller.submit({
+        broker_id: "broker-1",
         owner_document: "12345678900",
         side: "bid",
         symbol: "AAPL",

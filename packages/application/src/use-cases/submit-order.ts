@@ -1,30 +1,42 @@
-import type { AcceptedOrderResponse, SubmitOrderRequest } from "@decade/contracts";
+import type { AcceptedOrderResponse } from "@decade/contracts";
 import { createBrokerId } from "@decade/exchange-core";
-import type {
-  CommandPublisher,
-  Clock,
-  IdGenerator,
-  IdempotencyRepository,
-  Logger,
-  OrderRepository,
-  RequestHasher,
-  TransactionManager
-} from "../index";
 
 import {
   createAcceptedOrderRecord,
+  createIdempotencyRecord,
   createSubmitOrderCommand,
   parseSubmitOrderRequest,
+  recreateSubmitOrderCommand,
   toAcceptedOrderResponse
 } from "./helpers";
-import { InvariantError } from "../errors";
+import { ConflictError, InvariantError } from "../errors";
+import type { KafkaCommandPublisher } from "../kafka/kafka-command-publisher";
+import type { Clock } from "../ports/clock";
+import type { IdGenerator, RequestHasher } from "../ports/identity";
+import type { Logger } from "../ports/logger";
+import type { PostgresIdempotencyRepository } from "../postgres/postgres-idempotency-repository";
+import type { PostgresOrderRepository } from "../postgres/postgres-order-repository";
+import type { PostgresTransactionManager } from "../postgres/postgres-transaction-manager";
+import type { PersistedOrderRecord } from "../records";
 
-export interface SubmitOrderDependencies {
-  brokerId: string;
-  orderRepository: OrderRepository;
-  idempotencyRepository: IdempotencyRepository;
-  transactionManager: TransactionManager;
-  commandPublisher: CommandPublisher;
+type SubmissionAttempt =
+  | {
+      kind: "reused";
+      order: PersistedOrderRecord;
+    }
+  | {
+      kind: "publish";
+      order: PersistedOrderRecord;
+      command: ReturnType<typeof createSubmitOrderCommand>;
+      idempotencyKey: string;
+      logMessage: string;
+    };
+
+export interface SubmitOrderServices {
+  orders: PostgresOrderRepository;
+  idempotency: PostgresIdempotencyRepository;
+  transactions: PostgresTransactionManager;
+  commands: KafkaCommandPublisher;
   idGenerator: IdGenerator;
   requestHasher: RequestHasher;
   clock: Clock;
@@ -33,77 +45,116 @@ export interface SubmitOrderDependencies {
 }
 
 export class SubmitOrder {
-  constructor(private readonly dependencies: SubmitOrderDependencies) {}
+  constructor(private readonly services: SubmitOrderServices) {}
 
-  async execute(request: SubmitOrderRequest): Promise<AcceptedOrderResponse> {
+  async execute(request: unknown): Promise<AcceptedOrderResponse> {
     const parsedRequest = parseSubmitOrderRequest(request);
-    const brokerId = createBrokerId(this.dependencies.brokerId);
-    const existing = await this.dependencies.idempotencyRepository.findByBrokerAndKey(
-      brokerId,
-      parsedRequest.idempotency_key
+    const brokerId = createBrokerId(parsedRequest.broker_id);
+    const requestHash = this.services.requestHasher.hash(parsedRequest);
+    const attempt = await this.services.transactions.withTransaction<SubmissionAttempt>(
+      async (context) => {
+        const existing = await this.services.idempotency.findByBrokerAndKey(
+          brokerId,
+          parsedRequest.idempotency_key,
+          context
+        );
+
+        if (existing !== null) {
+          if (existing.requestHash !== requestHash) {
+            throw new ConflictError(
+              `idempotency key ${parsedRequest.idempotency_key} was already used for a different request`
+            );
+          }
+
+          const existingOrder = await this.services.orders.findOrderById(existing.orderId, context);
+
+          if (existingOrder === null) {
+            throw new InvariantError(
+              `idempotency key ${parsedRequest.idempotency_key} points to a missing order`
+            );
+          }
+
+          if (existing.publishStatus === "published") {
+            return {
+              kind: "reused",
+              order: existingOrder
+            };
+          }
+
+          return {
+            kind: "publish",
+            order: existingOrder,
+            command: recreateSubmitOrderCommand(existingOrder, existing),
+            idempotencyKey: parsedRequest.idempotency_key,
+            logMessage: "Order publish completed from pending idempotency record"
+          };
+        }
+
+        const acceptedAt = this.services.clock.now();
+        const orderId = this.services.idGenerator.nextOrderId();
+        const commandId = this.services.idGenerator.nextCommandId();
+        const acceptedOrder = createAcceptedOrderRecord({
+          orderId,
+          request: parsedRequest,
+          acceptedAt
+        });
+        const command = createSubmitOrderCommand({
+          commandId,
+          orderId: acceptedOrder.orderId,
+          request: parsedRequest,
+          acceptedAt
+        });
+
+        await this.services.orders.createAcceptedOrder(acceptedOrder, context);
+        await this.services.idempotency.create(
+          createIdempotencyRecord({
+            brokerId,
+            idempotencyKey: parsedRequest.idempotency_key,
+            order: acceptedOrder,
+            commandId,
+            requestHash,
+            createdAt: acceptedAt
+          }),
+          context
+        );
+
+        return {
+          kind: "publish",
+          order: acceptedOrder,
+          command,
+          idempotencyKey: parsedRequest.idempotency_key,
+          logMessage: "Order accepted"
+        };
+      }
     );
 
-    if (existing !== null) {
-      const existingOrder = await this.dependencies.orderRepository.findOrderById(existing.orderId);
-
-      if (existingOrder === null) {
-        throw new InvariantError(
-          `idempotency key ${parsedRequest.idempotency_key} points to a missing order`
-        );
-      }
-
-      this.dependencies.logger?.info("Idempotent order submission reused", {
+    if (attempt.kind === "reused") {
+      this.services.logger?.info("Idempotent order submission reused", {
         brokerId,
-        orderId: existingOrder.orderId
+        orderId: attempt.order.orderId
       });
 
-      return toAcceptedOrderResponse(existingOrder);
+      return toAcceptedOrderResponse(attempt.order);
     }
 
-    const acceptedAt = this.dependencies.clock.now();
-    const orderId = this.dependencies.idGenerator.nextOrderId();
-    const commandId = this.dependencies.idGenerator.nextCommandId();
-    const acceptedOrder = createAcceptedOrderRecord({
-      orderId,
+    await this.services.commands.publish({
+      topic: this.services.commandsTopic,
+      key: attempt.order.symbol,
+      command: attempt.command
+    });
+
+    await this.services.idempotency.markPublished(
       brokerId,
-      request: parsedRequest,
-      acceptedAt
-    });
-    const command = createSubmitOrderCommand({
-      commandId,
-      orderId: acceptedOrder.orderId,
+      attempt.idempotencyKey,
+      this.services.clock.now()
+    );
+
+    this.services.logger?.info(attempt.logMessage, {
       brokerId,
-      request: parsedRequest,
-      acceptedAt
-    });
-    const requestHash = this.dependencies.requestHasher.hash(parsedRequest);
-
-    await this.dependencies.transactionManager.withTransaction(async (context) => {
-      await this.dependencies.orderRepository.createAcceptedOrder(acceptedOrder, context);
-      await this.dependencies.idempotencyRepository.create(
-        {
-          brokerId: acceptedOrder.brokerId,
-          idempotencyKey: parsedRequest.idempotency_key,
-          orderId: acceptedOrder.orderId,
-          requestHash,
-          createdAt: acceptedAt
-        },
-        context
-      );
+      orderId: attempt.order.orderId,
+      symbol: attempt.order.symbol
     });
 
-    await this.dependencies.commandPublisher.publish({
-      topic: this.dependencies.commandsTopic,
-      key: acceptedOrder.symbol,
-      command
-    });
-
-    this.dependencies.logger?.info("Order accepted", {
-      brokerId,
-      orderId: acceptedOrder.orderId,
-      symbol: acceptedOrder.symbol
-    });
-
-    return toAcceptedOrderResponse(acceptedOrder);
+    return toAcceptedOrderResponse(attempt.order);
   }
 }

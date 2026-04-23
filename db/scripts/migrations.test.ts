@@ -214,13 +214,21 @@ describe("database migrations", () => {
         broker_id,
         idempotency_key,
         order_id,
+        command_id,
+        symbol,
         request_hash,
-        created_at
+        publish_status,
+        created_at,
+        published_at
       ) VALUES (
         'broker-1',
         'idem-1',
         'ord-1',
+        'cmd-1',
+        'AAPL',
         'hash-1',
+        'published',
+        '2026-01-01T14:00:00Z',
         '2026-01-01T14:00:00Z'
       )
     `);
@@ -231,13 +239,21 @@ describe("database migrations", () => {
           broker_id,
           idempotency_key,
           order_id,
+          command_id,
+          symbol,
           request_hash,
-          created_at
+          publish_status,
+          created_at,
+          published_at
         ) VALUES (
           'broker-1',
           'idem-1',
           'ord-1',
+          'cmd-2',
+          'AAPL',
           'hash-1',
+          'published',
+          '2026-01-01T14:00:01Z',
           '2026-01-01T14:00:01Z'
         )
       `)

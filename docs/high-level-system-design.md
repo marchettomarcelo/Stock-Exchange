@@ -30,6 +30,17 @@ The exchange supports the following core behavior:
 - partial fills are supported
 - when bid and ask cross, the trade executes at the seller price
 
+The order submission payload includes:
+
+- `broker_id`
+- `owner_document`
+- `side`
+- `symbol`
+- `price`
+- `quantity`
+- `valid_until`
+- `idempotency_key`
+
 This design does not cover:
 
 - brokerage balances or account management

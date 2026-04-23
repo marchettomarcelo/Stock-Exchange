@@ -2,20 +2,20 @@ import { describe, expect, it } from "vitest";
 
 import type {
   Clock,
-  CommandPublisher,
   IdGenerator,
-  IdempotencyRepository,
-  Lease,
-  LeaseManager,
-  OrderEventRepository,
-  OrderRepository,
-  ProcessedCommandRepository,
-  RequestHasher,
-  TradeRepository,
-  TransactionContext,
-  TransactionManager
+  KafkaCommandPublisher,
+  PostgresAdvisoryLockManager,
+  PostgresIdempotencyRepository,
+  PostgresOrderEventRepository,
+  PostgresOrderRepository,
+  PostgresProcessedCommandRepository,
+  PostgresTransactionContext,
+  PostgresTransactionManager,
+  PostgresTradeRepository,
+  RequestHasher
 } from "../index";
 import {
+  ConflictError,
   GetOrderStatus,
   ProcessExpireCommand,
   ProcessOrderCommand,
@@ -24,6 +24,7 @@ import {
   SymbolOrderBooks,
   type DueOrderRecord,
   type IdempotencyRecord,
+  type Lease,
   type OrderEventRecord,
   type PersistedOrderRecord,
   type ProcessedCommandRecord,
@@ -67,25 +68,39 @@ class FakeHasher implements RequestHasher {
   }
 }
 
-class FakePublisher implements CommandPublisher {
+class FakePublisher {
   readonly published: Array<{
     topic: string;
     key: string;
     command: unknown;
   }> = [];
+  failuresRemaining = 0;
+  error: Error = new Error("publish failed");
+
+  failNext(times = 1, error = new Error("publish failed")): void {
+    this.failuresRemaining = times;
+    this.error = error;
+  }
 
   async publish(command: { topic: string; key: string; command: unknown }) {
+    if (this.failuresRemaining > 0) {
+      this.failuresRemaining -= 1;
+      throw this.error;
+    }
+
     this.published.push(command);
   }
 }
 
-class FakeTransactionManager implements TransactionManager {
-  async withTransaction<T>(work: (context: TransactionContext) => Promise<T>): Promise<T> {
-    return work({ kind: "transaction" });
+class FakeTransactionManager {
+  async withTransaction<T>(
+    work: (context: PostgresTransactionContext) => Promise<T>
+  ): Promise<T> {
+    return work({ kind: "transaction" } as PostgresTransactionContext);
   }
 }
 
-class InMemoryOrderRepository implements OrderRepository {
+class InMemoryOrderRepository {
   readonly orders = new Map<string, PersistedOrderRecord>();
   private restingSequence = 1;
 
@@ -138,19 +153,41 @@ class InMemoryOrderRepository implements OrderRepository {
   }
 }
 
-class InMemoryIdempotencyRepository implements IdempotencyRepository {
+class InMemoryIdempotencyRepository {
   readonly keys = new Map<string, IdempotencyRecord>();
 
   async create(record: IdempotencyRecord): Promise<void> {
-    this.keys.set(`${record.brokerId}:${record.idempotencyKey}`, record);
+    this.keys.set(`${record.brokerId}:${record.idempotencyKey}`, { ...record });
   }
 
-  async findByBrokerAndKey(brokerId: string, idempotencyKey: string): Promise<IdempotencyRecord | null> {
+  async findByBrokerAndKey(
+    brokerId: string,
+    idempotencyKey: string
+  ): Promise<IdempotencyRecord | null> {
     return this.keys.get(`${brokerId}:${idempotencyKey}`) ?? null;
+  }
+
+  async markPublished(
+    brokerId: string,
+    idempotencyKey: string,
+    publishedAt: string
+  ): Promise<void> {
+    const key = `${brokerId}:${idempotencyKey}`;
+    const record = this.keys.get(key);
+
+    if (record === undefined) {
+      return;
+    }
+
+    this.keys.set(key, {
+      ...record,
+      publishStatus: "published",
+      publishedAt
+    });
   }
 }
 
-class InMemoryTradeRepository implements TradeRepository {
+class InMemoryTradeRepository {
   readonly trades: TradeRecord[] = [];
 
   async appendTrades(trades: TradeRecord[]): Promise<void> {
@@ -164,7 +201,7 @@ class InMemoryTradeRepository implements TradeRepository {
   }
 }
 
-class InMemoryOrderEventRepository implements OrderEventRepository {
+class InMemoryOrderEventRepository {
   readonly events: OrderEventRecord[] = [];
 
   async appendEvents(events: OrderEventRecord[]): Promise<void> {
@@ -176,7 +213,7 @@ class InMemoryOrderEventRepository implements OrderEventRepository {
   }
 }
 
-class InMemoryProcessedCommandRepository implements ProcessedCommandRepository {
+class InMemoryProcessedCommandRepository {
   readonly processed = new Map<string, ProcessedCommandRecord>();
 
   async markProcessed(record: ProcessedCommandRecord): Promise<void> {
@@ -198,12 +235,50 @@ class FakeLease implements Lease {
   }
 }
 
-class FakeLeaseManager implements LeaseManager {
+class FakeLeaseManager {
   lease: FakeLease | null = new FakeLease("expiration-scheduler");
 
   async tryAcquire(): Promise<Lease | null> {
     return this.lease;
   }
+}
+
+function asOrdersStore(repository: InMemoryOrderRepository): PostgresOrderRepository {
+  return repository as unknown as PostgresOrderRepository;
+}
+
+function asIdempotencyStore(
+  repository: InMemoryIdempotencyRepository
+): PostgresIdempotencyRepository {
+  return repository as unknown as PostgresIdempotencyRepository;
+}
+
+function asTradesStore(repository: InMemoryTradeRepository): PostgresTradeRepository {
+  return repository as unknown as PostgresTradeRepository;
+}
+
+function asEventsStore(
+  repository: InMemoryOrderEventRepository
+): PostgresOrderEventRepository {
+  return repository as unknown as PostgresOrderEventRepository;
+}
+
+function asProcessedCommandsStore(
+  repository: InMemoryProcessedCommandRepository
+): PostgresProcessedCommandRepository {
+  return repository as unknown as PostgresProcessedCommandRepository;
+}
+
+function asTransactionManager(manager: FakeTransactionManager): PostgresTransactionManager {
+  return manager as unknown as PostgresTransactionManager;
+}
+
+function asPublisher(publisher: FakePublisher): KafkaCommandPublisher {
+  return publisher as unknown as KafkaCommandPublisher;
+}
+
+function asLeaseManager(manager: FakeLeaseManager): PostgresAdvisoryLockManager {
+  return manager as unknown as PostgresAdvisoryLockManager;
 }
 
 function seedOrder(
@@ -233,11 +308,10 @@ describe("application use cases", () => {
     const idempotency = new InMemoryIdempotencyRepository();
     const publisher = new FakePublisher();
     const useCase = new SubmitOrder({
-      brokerId: "broker-1",
-      orderRepository: orders,
-      idempotencyRepository: idempotency,
-      transactionManager: new FakeTransactionManager(),
-      commandPublisher: publisher,
+      orders: asOrdersStore(orders),
+      idempotency: asIdempotencyStore(idempotency),
+      transactions: asTransactionManager(new FakeTransactionManager()),
+      commands: asPublisher(publisher),
       idGenerator: new FakeIdGenerator(),
       requestHasher: new FakeHasher(),
       clock: new FakeClock("2026-01-01T14:00:00Z"),
@@ -245,6 +319,7 @@ describe("application use cases", () => {
     });
 
     const request = {
+      broker_id: "broker-1",
       owner_document: "12345678900",
       side: "bid" as const,
       symbol: "AAPL",
@@ -265,6 +340,182 @@ describe("application use cases", () => {
     expect(secondResponse).toEqual(firstResponse);
     expect(publisher.published).toHaveLength(1);
     expect(orders.orders.get("ord-1")?.status).toBe("accepted");
+    expect(idempotency.keys.get("broker-1:idem-1")).toEqual(
+      expect.objectContaining({
+        orderId: "ord-1",
+        commandId: "cmd-1",
+        symbol: "AAPL",
+        publishStatus: "published"
+      })
+    );
+  });
+
+  it("rejects reusing an idempotency key with a different request payload", async () => {
+    const orders = new InMemoryOrderRepository();
+    const idempotency = new InMemoryIdempotencyRepository();
+    const publisher = new FakePublisher();
+    const useCase = new SubmitOrder({
+      orders: asOrdersStore(orders),
+      idempotency: asIdempotencyStore(idempotency),
+      transactions: asTransactionManager(new FakeTransactionManager()),
+      commands: asPublisher(publisher),
+      idGenerator: new FakeIdGenerator(),
+      requestHasher: new FakeHasher(),
+      clock: new FakeClock("2026-01-01T14:00:00Z"),
+      commandsTopic: "exchange.commands"
+    });
+
+    await useCase.execute({
+      broker_id: "broker-1",
+      owner_document: "12345678900",
+      side: "bid",
+      symbol: "AAPL",
+      price: 100,
+      quantity: 10,
+      valid_until: "2026-01-01T15:00:00Z",
+      idempotency_key: "idem-1"
+    });
+
+    await expect(
+      useCase.execute({
+        broker_id: "broker-1",
+        owner_document: "12345678900",
+        side: "ask",
+        symbol: "AAPL",
+        price: 100,
+        quantity: 10,
+        valid_until: "2026-01-01T15:00:00Z",
+        idempotency_key: "idem-1"
+      })
+    ).rejects.toBeInstanceOf(ConflictError);
+    expect(publisher.published).toHaveLength(1);
+  });
+
+  it("republishes a pending idempotent order after a publish failure", async () => {
+    const orders = new InMemoryOrderRepository();
+    const idempotency = new InMemoryIdempotencyRepository();
+    const publisher = new FakePublisher();
+    publisher.failNext(1);
+
+    const useCase = new SubmitOrder({
+      orders: asOrdersStore(orders),
+      idempotency: asIdempotencyStore(idempotency),
+      transactions: asTransactionManager(new FakeTransactionManager()),
+      commands: asPublisher(publisher),
+      idGenerator: new FakeIdGenerator(),
+      requestHasher: new FakeHasher(),
+      clock: new FakeClock("2026-01-01T14:00:00Z"),
+      commandsTopic: "exchange.commands"
+    });
+
+    const request = {
+      broker_id: "broker-1",
+      owner_document: "12345678900",
+      side: "bid" as const,
+      symbol: "AAPL",
+      price: 100,
+      quantity: 10,
+      valid_until: "2026-01-01T15:00:00Z",
+      idempotency_key: "idem-1"
+    };
+
+    await expect(useCase.execute(request)).rejects.toThrow("publish failed");
+    expect(orders.orders.get("ord-1")?.status).toBe("accepted");
+    expect(idempotency.keys.get("broker-1:idem-1")).toEqual(
+      expect.objectContaining({
+        orderId: "ord-1",
+        commandId: "cmd-1",
+        publishStatus: "pending",
+        publishedAt: null
+      })
+    );
+
+    const retryResponse = await useCase.execute(request);
+
+    expect(retryResponse).toEqual({
+      order_id: "ord-1",
+      status: "accepted",
+      accepted_at: "2026-01-01T14:00:00.000Z"
+    });
+    expect(publisher.published).toHaveLength(1);
+    expect(publisher.published[0]).toEqual({
+      topic: "exchange.commands",
+      key: "AAPL",
+      command: {
+        command_id: "cmd-1",
+        command_type: "SubmitOrder",
+        order_id: "ord-1",
+        broker_id: "broker-1",
+        owner_document: "12345678900",
+        side: "bid",
+        symbol: "AAPL",
+        price: 100,
+        quantity: 10,
+        valid_until: "2026-01-01T15:00:00.000Z",
+        accepted_at: "2026-01-01T14:00:00.000Z"
+      }
+    });
+    expect(idempotency.keys.get("broker-1:idem-1")).toEqual(
+      expect.objectContaining({
+        publishStatus: "published",
+        publishedAt: "2026-01-01T14:00:00.000Z"
+      })
+    );
+  });
+
+  it("scopes idempotency by request broker_id", async () => {
+    const orders = new InMemoryOrderRepository();
+    const idempotency = new InMemoryIdempotencyRepository();
+    const publisher = new FakePublisher();
+    const useCase = new SubmitOrder({
+      orders: asOrdersStore(orders),
+      idempotency: asIdempotencyStore(idempotency),
+      transactions: asTransactionManager(new FakeTransactionManager()),
+      commands: asPublisher(publisher),
+      idGenerator: new FakeIdGenerator(),
+      requestHasher: new FakeHasher(),
+      clock: new FakeClock("2026-01-01T14:00:00Z"),
+      commandsTopic: "exchange.commands"
+    });
+
+    const firstResponse = await useCase.execute({
+      broker_id: "broker-1",
+      owner_document: "12345678900",
+      side: "bid",
+      symbol: "AAPL",
+      price: 100,
+      quantity: 10,
+      valid_until: "2026-01-01T15:00:00Z",
+      idempotency_key: "idem-1"
+    });
+
+    const secondResponse = await useCase.execute({
+      broker_id: "broker-2",
+      owner_document: "12345678900",
+      side: "bid",
+      symbol: "AAPL",
+      price: 100,
+      quantity: 10,
+      valid_until: "2026-01-01T15:00:00Z",
+      idempotency_key: "idem-1"
+    });
+
+    expect(firstResponse.order_id).toBe("ord-1");
+    expect(secondResponse.order_id).toBe("ord-2");
+    expect(orders.orders.get("ord-1")?.brokerId).toBe("broker-1");
+    expect(orders.orders.get("ord-2")?.brokerId).toBe("broker-2");
+    expect(publisher.published).toEqual([
+      expect.objectContaining({
+        command: expect.objectContaining({
+          broker_id: "broker-1"
+        })
+      }),
+      expect.objectContaining({
+        command: expect.objectContaining({
+          broker_id: "broker-2"
+        })
+      })
+    ]);
   });
 
   it("returns persisted order status for broker reads", async () => {
@@ -276,7 +527,7 @@ describe("application use cases", () => {
     });
 
     const response = await new GetOrderStatus({
-      orderRepository: orders
+      orders: asOrdersStore(orders)
     }).execute("ord-1");
 
     expect(response).toMatchObject({
@@ -312,11 +563,11 @@ describe("application use cases", () => {
     });
 
     const result = await new ProcessOrderCommand({
-      processedCommandRepository: processedCommands,
-      orderRepository: orders,
-      tradeRepository: trades,
-      orderEventRepository: events,
-      transactionManager: new FakeTransactionManager(),
+      processedCommands: asProcessedCommandsStore(processedCommands),
+      orders: asOrdersStore(orders),
+      trades: asTradesStore(trades),
+      orderEvents: asEventsStore(events),
+      transactions: asTransactionManager(new FakeTransactionManager()),
       clock: new FakeClock("2026-01-01T14:00:05Z"),
       symbolBooks: books
     }).execute({
@@ -364,10 +615,10 @@ describe("application use cases", () => {
     });
 
     const result = await new ProcessExpireCommand({
-      processedCommandRepository: processedCommands,
-      orderRepository: orders,
-      orderEventRepository: events,
-      transactionManager: new FakeTransactionManager(),
+      processedCommands: asProcessedCommandsStore(processedCommands),
+      orders: asOrdersStore(orders),
+      orderEvents: asEventsStore(events),
+      transactions: asTransactionManager(new FakeTransactionManager()),
       clock: new FakeClock("2026-01-01T14:00:01Z"),
       symbolBooks: new SymbolOrderBooks()
     }).execute({
@@ -399,9 +650,9 @@ describe("application use cases", () => {
     });
 
     const result = await new ScanForExpiredOrders({
-      leaseManager,
-      orderRepository: orders,
-      commandPublisher: publisher,
+      leaseManager: asLeaseManager(leaseManager),
+      orders: asOrdersStore(orders),
+      commands: asPublisher(publisher),
       idGenerator: new FakeIdGenerator(),
       clock: new FakeClock("2026-01-01T14:00:01Z"),
       commandsTopic: "exchange.commands"

@@ -106,7 +106,6 @@ services:
     environment:
       DATABASE_URL: postgres://decade:decade@postgres:5432/decade
       DATABASE_MAX_CONNECTIONS: "10"
-      BROKER_ID: broker-api
       KAFKA_BROKERS: kafka:9092
       KAFKA_CLIENT_ID: broker-api
       KAFKA_COMMANDS_PARTITIONS: ${KAFKA_COMMANDS_PARTITIONS:-2}

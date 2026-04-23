@@ -53,6 +53,12 @@ export interface IdempotencyRepository {
     idempotencyKey: string,
     context?: TransactionContext
   ): Promise<IdempotencyRecord | null>;
+  markPublished(
+    brokerId: BrokerId,
+    idempotencyKey: string,
+    publishedAt: IsoTimestamp,
+    context?: TransactionContext
+  ): Promise<void>;
 }
 
 export interface ProcessedCommandRepository {
@@ -65,4 +71,3 @@ export interface ProcessedCommandRepository {
     context?: TransactionContext
   ): Promise<ProcessedCommandRecord | null>;
 }
-

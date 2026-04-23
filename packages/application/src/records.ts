@@ -10,6 +10,8 @@ import type {
   ValidUntil
 } from "@decade/exchange-core";
 
+export type IdempotencyPublishStatus = "pending" | "published";
+
 export interface PersistedOrderRecord {
   orderId: OrderId;
   brokerId: BrokerId;
@@ -59,8 +61,12 @@ export interface IdempotencyRecord {
   brokerId: BrokerId;
   idempotencyKey: string;
   orderId: OrderId;
+  commandId: string;
+  symbol: Symbol;
   requestHash: string;
+  publishStatus: IdempotencyPublishStatus;
   createdAt: IsoTimestamp;
+  publishedAt: IsoTimestamp | null;
 }
 
 export interface ProcessedCommandRecord {
@@ -70,4 +76,3 @@ export interface ProcessedCommandRecord {
   orderId: OrderId | null;
   processedAt: IsoTimestamp;
 }
-

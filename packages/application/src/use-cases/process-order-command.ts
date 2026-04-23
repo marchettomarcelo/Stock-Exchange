@@ -10,31 +10,29 @@ import {
   type OrderSnapshot
 } from "@decade/exchange-core";
 
-import type {
-  Clock,
-  Logger,
-  OrderEventRepository,
-  OrderRepository,
-  ProcessedCommandRepository,
-  TradeRepository,
-  TransactionManager
-} from "../index";
 import type { PersistedOrderRecord } from "../records";
 import { InvariantError, NotFoundError } from "../errors";
+import type { Clock } from "../ports/clock";
+import type { Logger } from "../ports/logger";
+import type { PostgresOrderEventRepository } from "../postgres/postgres-order-event-repository";
+import type { PostgresOrderRepository } from "../postgres/postgres-order-repository";
+import type { PostgresProcessedCommandRepository } from "../postgres/postgres-processed-command-repository";
+import type { PostgresTradeRepository } from "../postgres/postgres-trade-repository";
+import type { PostgresTransactionContext } from "../postgres/postgres-types";
+import type { PostgresTransactionManager } from "../postgres/postgres-transaction-manager";
 import type { SymbolOrderBooks } from "../symbol-order-books";
 import {
   createStateUpdateEvent,
-  parseSubmitOrderCommand,
   shouldKeepRestingSequence,
   toPersistedOrderRecord
 } from "./helpers";
 
-export interface ProcessOrderCommandDependencies {
-  processedCommandRepository: ProcessedCommandRepository;
-  orderRepository: OrderRepository;
-  tradeRepository: TradeRepository;
-  orderEventRepository: OrderEventRepository;
-  transactionManager: TransactionManager;
+export interface ProcessOrderCommandServices {
+  processedCommands: PostgresProcessedCommandRepository;
+  orders: PostgresOrderRepository;
+  trades: PostgresTradeRepository;
+  orderEvents: PostgresOrderEventRepository;
+  transactions: PostgresTransactionManager;
   clock: Clock;
   symbolBooks: SymbolOrderBooks;
   logger?: Logger;
@@ -48,56 +46,55 @@ export interface ProcessOrderCommandResult {
 }
 
 export class ProcessOrderCommand {
-  constructor(private readonly dependencies: ProcessOrderCommandDependencies) {}
+  constructor(private readonly services: ProcessOrderCommandServices) {}
 
   async execute(command: SubmitOrderCommand): Promise<ProcessOrderCommandResult> {
-    const parsedCommand = parseSubmitOrderCommand(command);
-    const orderId = createOrderId(parsedCommand.order_id);
-    const symbol = createSymbol(parsedCommand.symbol);
-    const processedAt = this.dependencies.clock.now();
-    const existingMarker = await this.dependencies.processedCommandRepository.findByCommandId(
-      parsedCommand.command_id
+    const orderId = createOrderId(command.order_id);
+    const symbol = createSymbol(command.symbol);
+    const processedAt = this.services.clock.now();
+    const existingMarker = await this.services.processedCommands.findByCommandId(
+      command.command_id
     );
 
     if (existingMarker !== null) {
       return {
         status: "duplicate",
-        orderId: parsedCommand.order_id
+        orderId: command.order_id
       };
     }
 
-    const persistedOrder = await this.dependencies.orderRepository.findOrderById(orderId);
+    const persistedOrder = await this.services.orders.findOrderById(orderId);
 
     if (persistedOrder === null) {
-      throw new NotFoundError(`Order ${parsedCommand.order_id} was not found`);
+      throw new NotFoundError(`Order ${command.order_id} was not found`);
     }
 
-    const book = await this.dependencies.symbolBooks.getOrCreate(
+    const book = await this.services.symbolBooks.getOrCreate(
       symbol,
-      async () => this.dependencies.orderRepository.listRestingOrdersForSymbol(symbol)
+      async () => this.services.orders.listRestingOrdersForSymbol(symbol)
     );
     const matchResult = book.placeOrder(
       {
         orderId,
-        brokerId: createBrokerId(parsedCommand.broker_id),
-        ownerDocument: createOwnerDocument(parsedCommand.owner_document),
+        brokerId: createBrokerId(command.broker_id),
+        ownerDocument: createOwnerDocument(command.owner_document),
         symbol,
-        side: parsedCommand.side,
-        price: createPrice(parsedCommand.price),
-        quantity: createQuantity(parsedCommand.quantity),
-        validUntil: createValidUntil(parsedCommand.valid_until),
+        side: command.side,
+        price: createPrice(command.price),
+        quantity: createQuantity(command.quantity),
+        validUntil: createValidUntil(command.valid_until),
         acceptedAt: persistedOrder.acceptedAt
       },
       processedAt
     );
 
-    await this.dependencies.transactionManager.withTransaction(async (context) => {
+    await this.services.transactions.withTransaction(async (context) => {
       const updatedOrders = await Promise.all(
         matchResult.updates.map(async (snapshot) => {
           const currentRecord =
             snapshot.orderId === persistedOrder.orderId
               ? persistedOrder
-              : await this.dependencies.orderRepository.findOrderById(snapshot.orderId, context);
+              : await this.services.orders.findOrderById(snapshot.orderId, context);
           const restingSequence = await this.resolveRestingSequence(
             snapshot,
             currentRecord,
@@ -109,13 +106,13 @@ export class ProcessOrderCommand {
             restingSequence
           });
 
-          await this.dependencies.orderRepository.updateOrder(record, context);
+          await this.services.orders.updateOrder(record, context);
 
           return record;
         })
       );
 
-      await this.dependencies.tradeRepository.appendTrades(
+      await this.services.trades.appendTrades(
         matchResult.trades.map((trade) => ({
           symbol: trade.symbol,
           buyOrderId: trade.buyOrderId,
@@ -126,22 +123,22 @@ export class ProcessOrderCommand {
         })),
         context
       );
-      await this.dependencies.orderEventRepository.appendEvents(
+      await this.services.orderEvents.appendEvents(
         updatedOrders.map((order) =>
           createStateUpdateEvent({
             orderId: order.orderId,
             status: order.status,
             remainingQuantity: order.remainingQuantity,
-            commandId: parsedCommand.command_id,
+            commandId: command.command_id,
             createdAt: processedAt
           })
         ),
         context
       );
-      await this.dependencies.processedCommandRepository.markProcessed(
+      await this.services.processedCommands.markProcessed(
         {
-          commandId: parsedCommand.command_id,
-          commandType: parsedCommand.command_type,
+          commandId: command.command_id,
+          commandType: command.command_type,
           symbol,
           orderId,
           processedAt
@@ -150,15 +147,15 @@ export class ProcessOrderCommand {
       );
     });
 
-    this.dependencies.logger?.info("Order command processed", {
-      orderId: parsedCommand.order_id,
+    this.services.logger?.info("Order command processed", {
+      orderId: command.order_id,
       status: matchResult.order.status,
       trades: matchResult.trades.length
     });
 
     return {
       status: "processed",
-      orderId: parsedCommand.order_id,
+      orderId: command.order_id,
       finalStatus: matchResult.order.status,
       trades: matchResult.trades.length
     };
@@ -167,7 +164,7 @@ export class ProcessOrderCommand {
   private async resolveRestingSequence(
     snapshot: OrderSnapshot,
     currentRecord: PersistedOrderRecord | null,
-    context: unknown
+    context: PostgresTransactionContext
   ): Promise<number | null> {
     if (!shouldKeepRestingSequence(snapshot.status)) {
       return null;
@@ -181,6 +178,6 @@ export class ProcessOrderCommand {
       throw new InvariantError(`Order ${snapshot.orderId} is missing a resting sequence`);
     }
 
-    return this.dependencies.orderRepository.nextRestingSequence(context as never);
+    return this.services.orders.nextRestingSequence(context);
   }
 }

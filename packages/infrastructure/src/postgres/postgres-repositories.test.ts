@@ -180,9 +180,18 @@ describe("PostgreSQL repositories", () => {
       brokerId: createBrokerId("broker-1"),
       idempotencyKey: "idem-1",
       orderId: createOrderId("ord-1"),
+      commandId: "cmd-submit-1",
+      symbol: createSymbol("AAPL"),
       requestHash: "hash-1",
-      createdAt: createIsoTimestamp("2026-01-01T14:00:00Z")
+      publishStatus: "pending",
+      createdAt: createIsoTimestamp("2026-01-01T14:00:00Z"),
+      publishedAt: null
     });
+    await idempotencyRepository.markPublished(
+      createBrokerId("broker-1"),
+      "idem-1",
+      createIsoTimestamp("2026-01-01T14:00:01Z")
+    );
     await processedCommandRepository.markProcessed({
       commandId: "cmd-1",
       commandType: "SubmitOrder",
@@ -211,7 +220,11 @@ describe("PostgreSQL repositories", () => {
     ).toEqual(
       expect.objectContaining({
         orderId: "ord-1",
-        requestHash: "hash-1"
+        commandId: "cmd-submit-1",
+        symbol: "AAPL",
+        requestHash: "hash-1",
+        publishStatus: "published",
+        publishedAt: "2026-01-01T14:00:01.000Z"
       })
     );
     expect(await processedCommandRepository.findByCommandId("cmd-1")).toEqual(

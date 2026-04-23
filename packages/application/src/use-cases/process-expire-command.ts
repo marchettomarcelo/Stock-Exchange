@@ -1,24 +1,21 @@
 import type { ExpireOrderCommand } from "@decade/contracts";
-import { expireOrderCommandSchema } from "@decade/contracts";
 import { createOrderId, createSymbol, type IsoTimestamp, type OrderId, type Symbol } from "@decade/exchange-core";
 
-import type {
-  Clock,
-  Logger,
-  OrderEventRepository,
-  OrderRepository,
-  ProcessedCommandRepository,
-  TransactionManager
-} from "../index";
 import { InvariantError } from "../errors";
+import type { Clock } from "../ports/clock";
+import type { Logger } from "../ports/logger";
+import type { PostgresOrderEventRepository } from "../postgres/postgres-order-event-repository";
+import type { PostgresOrderRepository } from "../postgres/postgres-order-repository";
+import type { PostgresProcessedCommandRepository } from "../postgres/postgres-processed-command-repository";
+import type { PostgresTransactionManager } from "../postgres/postgres-transaction-manager";
 import type { SymbolOrderBooks } from "../symbol-order-books";
 import { createStateUpdateEvent } from "./helpers";
 
-export interface ProcessExpireCommandDependencies {
-  processedCommandRepository: ProcessedCommandRepository;
-  orderRepository: OrderRepository;
-  orderEventRepository: OrderEventRepository;
-  transactionManager: TransactionManager;
+export interface ProcessExpireCommandServices {
+  processedCommands: PostgresProcessedCommandRepository;
+  orders: PostgresOrderRepository;
+  orderEvents: PostgresOrderEventRepository;
+  transactions: PostgresTransactionManager;
   clock: Clock;
   symbolBooks: SymbolOrderBooks;
   logger?: Logger;
@@ -31,32 +28,31 @@ export interface ProcessExpireCommandResult {
 }
 
 export class ProcessExpireCommand {
-  constructor(private readonly dependencies: ProcessExpireCommandDependencies) {}
+  constructor(private readonly services: ProcessExpireCommandServices) {}
 
   async execute(command: ExpireOrderCommand): Promise<ProcessExpireCommandResult> {
-    const parsedCommand = expireOrderCommandSchema.parse(command);
-    const orderId = createOrderId(parsedCommand.order_id);
-    const symbol = createSymbol(parsedCommand.symbol);
-    const processedAt = this.dependencies.clock.now();
-    const existingMarker = await this.dependencies.processedCommandRepository.findByCommandId(
-      parsedCommand.command_id
+    const orderId = createOrderId(command.order_id);
+    const symbol = createSymbol(command.symbol);
+    const processedAt = this.services.clock.now();
+    const existingMarker = await this.services.processedCommands.findByCommandId(
+      command.command_id
     );
 
     if (existingMarker !== null) {
       return {
         status: "duplicate",
-        orderId: parsedCommand.order_id
+        orderId: command.order_id
       };
     }
 
-    const order = await this.dependencies.orderRepository.findOrderById(orderId);
+    const order = await this.services.orders.findOrderById(orderId);
 
     if (order === null) {
-      await this.dependencies.transactionManager.withTransaction(async (context) => {
-        await this.dependencies.processedCommandRepository.markProcessed(
+      await this.services.transactions.withTransaction(async (context) => {
+        await this.services.processedCommands.markProcessed(
           {
-            commandId: parsedCommand.command_id,
-            commandType: parsedCommand.command_type,
+            commandId: command.command_id,
+            commandType: command.command_type,
             symbol,
             orderId: null,
             processedAt
@@ -67,27 +63,27 @@ export class ProcessExpireCommand {
 
       return {
         status: "skipped",
-        orderId: parsedCommand.order_id,
+        orderId: command.order_id,
         reason: "missing_order"
       };
     }
 
     if (new Date(order.validUntil).getTime() > new Date(processedAt).getTime()) {
-      await this.markProcessedNoop(parsedCommand, order.orderId, processedAt);
+      await this.markProcessedNoop(command, order.orderId, processedAt);
 
       return {
         status: "skipped",
-        orderId: parsedCommand.order_id,
+        orderId: command.order_id,
         reason: "not_expired"
       };
     }
 
     if (order.status === "filled" || order.status === "expired") {
-      await this.markProcessedNoop(parsedCommand, order.orderId, processedAt);
+      await this.markProcessedNoop(command, order.orderId, processedAt);
 
       return {
         status: "skipped",
-        orderId: parsedCommand.order_id,
+        orderId: command.order_id,
         reason: `already_${order.status}`
       };
     }
@@ -102,24 +98,24 @@ export class ProcessExpireCommand {
           }
         : await this.expireOpenOrder(order.orderId, order.symbol, processedAt);
 
-    await this.dependencies.transactionManager.withTransaction(async (context) => {
-      await this.dependencies.orderRepository.updateOrder(updatedOrder, context);
-      await this.dependencies.orderEventRepository.appendEvents(
+    await this.services.transactions.withTransaction(async (context) => {
+      await this.services.orders.updateOrder(updatedOrder, context);
+      await this.services.orderEvents.appendEvents(
         [
           createStateUpdateEvent({
             orderId: updatedOrder.orderId,
             status: updatedOrder.status,
             remainingQuantity: updatedOrder.remainingQuantity,
-            commandId: parsedCommand.command_id,
+            commandId: command.command_id,
             createdAt: processedAt
           })
         ],
         context
       );
-      await this.dependencies.processedCommandRepository.markProcessed(
+      await this.services.processedCommands.markProcessed(
         {
-          commandId: parsedCommand.command_id,
-          commandType: parsedCommand.command_type,
+          commandId: command.command_id,
+          commandType: command.command_type,
           symbol,
           orderId: updatedOrder.orderId,
           processedAt
@@ -128,20 +124,20 @@ export class ProcessExpireCommand {
       );
     });
 
-    this.dependencies.logger?.info("Order expired", {
+    this.services.logger?.info("Order expired", {
       orderId: updatedOrder.orderId,
       symbol: updatedOrder.symbol
     });
 
     return {
       status: "expired",
-      orderId: parsedCommand.order_id
+      orderId: command.order_id
     };
   }
 
   private async expireOpenOrder(orderId: OrderId, symbol: Symbol, processedAt: IsoTimestamp) {
-    const book = await this.dependencies.symbolBooks.getOrCreate(symbol, async () =>
-      this.dependencies.orderRepository.listRestingOrdersForSymbol(symbol)
+    const book = await this.services.symbolBooks.getOrCreate(symbol, async () =>
+      this.services.orders.listRestingOrdersForSymbol(symbol)
     );
     const expiredSnapshot = book.expireOrder(orderId, processedAt);
 
@@ -171,8 +167,8 @@ export class ProcessExpireCommand {
     orderId: OrderId | null,
     processedAt: IsoTimestamp
   ): Promise<void> {
-    await this.dependencies.transactionManager.withTransaction(async (context) => {
-      await this.dependencies.processedCommandRepository.markProcessed(
+    await this.services.transactions.withTransaction(async (context) => {
+      await this.services.processedCommands.markProcessed(
         {
           commandId: command.command_id,
           commandType: command.command_type,

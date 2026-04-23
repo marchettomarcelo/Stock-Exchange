@@ -1,26 +1,27 @@
 import type { OrderStatusResponse } from "@decade/contracts";
 import { createOrderId } from "@decade/exchange-core";
 
-import type { Logger, OrderRepository } from "../index";
 import { NotFoundError } from "../errors";
+import type { Logger } from "../ports/logger";
+import type { PostgresOrderRepository } from "../postgres/postgres-order-repository";
 import { toOrderStatusResponse } from "./helpers";
 
-export interface GetOrderStatusDependencies {
-  orderRepository: OrderRepository;
+export interface GetOrderStatusServices {
+  orders: PostgresOrderRepository;
   logger?: Logger;
 }
 
 export class GetOrderStatus {
-  constructor(private readonly dependencies: GetOrderStatusDependencies) {}
+  constructor(private readonly services: GetOrderStatusServices) {}
 
   async execute(orderId: string): Promise<OrderStatusResponse> {
-    const order = await this.dependencies.orderRepository.findOrderById(createOrderId(orderId));
+    const order = await this.services.orders.findOrderById(createOrderId(orderId));
 
     if (order === null) {
       throw new NotFoundError(`Order ${orderId} was not found`);
     }
 
-    this.dependencies.logger?.debug("Order status fetched", {
+    this.services.logger?.debug("Order status fetched", {
       orderId: order.orderId,
       status: order.status
     });
@@ -28,4 +29,3 @@ export class GetOrderStatus {
     return toOrderStatusResponse(order);
   }
 }
-

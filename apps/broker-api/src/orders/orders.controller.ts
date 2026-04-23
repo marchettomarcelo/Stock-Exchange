@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Body,
+  ConflictException,
   Controller,
   Get,
   HttpCode,
@@ -12,10 +13,9 @@ import {
   Post
 } from "@nestjs/common";
 
-import { ApplicationError, NotFoundError } from "@decade/application";
+import { ApplicationError, ConflictError, NotFoundError } from "@decade/application";
 import type { GetOrderStatus, SubmitOrder } from "@decade/application";
-import type { AcceptedOrderResponse, OrderStatusResponse, SubmitOrderRequest } from "@decade/contracts";
-import { submitOrderRequestSchema } from "@decade/contracts";
+import type { AcceptedOrderResponse, OrderStatusResponse } from "@decade/contracts";
 
 import { GET_ORDER_STATUS_USE_CASE, SUBMIT_ORDER_USE_CASE } from "../runtime/runtime.tokens";
 
@@ -29,10 +29,8 @@ export class OrdersController {
   @Post()
   @HttpCode(HttpStatus.ACCEPTED)
   async submit(@Body() body: unknown): Promise<AcceptedOrderResponse> {
-    const request = parseSubmitOrderRequest(body);
-
     try {
-      return await this.submitOrder.execute(request);
+      return await this.submitOrder.execute(body);
     } catch (error) {
       throw toHttpError(error);
     }
@@ -48,22 +46,16 @@ export class OrdersController {
   }
 }
 
-function parseSubmitOrderRequest(body: unknown): SubmitOrderRequest {
-  const parsed = submitOrderRequestSchema.safeParse(body);
-
-  if (!parsed.success) {
-    throw new BadRequestException({
-      message: "Invalid order submission request",
-      issues: parsed.error.issues
-    });
-  }
-
-  return parsed.data;
-}
-
 function toHttpError(error: unknown): Error {
   if (error instanceof BadRequestException) {
     return error;
+  }
+
+  if (isZodError(error)) {
+    return new BadRequestException({
+      message: "Invalid order submission request",
+      issues: error.issues
+    });
   }
 
   if (error instanceof Error && error.name === "DomainValidationError") {
@@ -76,9 +68,22 @@ function toHttpError(error: unknown): Error {
     return new NotFoundException(error.message);
   }
 
+  if (error instanceof ConflictError) {
+    return new ConflictException(error.message);
+  }
+
   if (error instanceof ApplicationError) {
     return new InternalServerErrorException(error.message);
   }
 
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function isZodError(error: unknown): error is { issues: unknown[] } {
+  return (
+    error instanceof Error &&
+    error.name === "ZodError" &&
+    "issues" in error &&
+    Array.isArray(error.issues)
+  );
 }
