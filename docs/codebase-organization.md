@@ -1,7 +1,5 @@
 # Codebase Organization
 
-Note: `docs/engineering-case-marcelo.md` is deleted in the current working tree, so this document is based on the last committed version of that spec (`git show HEAD:docs/engineering-case-marcelo.md`) plus the current codebase.
-
 ## Overview
 
 This repository is a TypeScript monorepo for the exchange system described in [`high-level-system-design.md`](./high-level-system-design.md).

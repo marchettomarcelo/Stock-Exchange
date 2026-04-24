@@ -2,6 +2,7 @@
 
 Decade is a small exchange prototype built as a TypeScript monorepo. It accepts broker orders, routes symbol-keyed commands through Kafka, matches them in horizontally scalable engine workers, and persists durable state in PostgreSQL.
 
+
 ## What It Does
 
 - Accepts `POST /orders` and returns an exchange `order_id`
@@ -9,6 +10,13 @@ Decade is a small exchange prototype built as a TypeScript monorepo. It accepts 
 - Matches orders with price-time priority
 - Expires orders through the same ordered Kafka path used for submissions
 - Serves `GET /orders/:orderId` from PostgreSQL
+
+
+## Architecture
+
+![Decade Exchange architecture](./arquitetura.png)
+
+`broker-api` accepts broker submissions behind HAProxy, validates and persists the accepted order in PostgreSQL, and publishes symbol-keyed commands to Kafka. `matching-engine` workers consume those commands, own the in-memory order books for their assigned symbols, write resulting order updates and trades back to PostgreSQL, and run the expiration scan that republishes due orders through the same Kafka path.
 
 
 ## Stack
